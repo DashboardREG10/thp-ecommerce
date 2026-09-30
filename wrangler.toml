@@ -1,0 +1,9 @@
+name = "e-commerce-system"
+compatibility_date = "2024-03-20"
+pages_build_output_dir = "."
+
+# Binding for Cloudflare D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "ecommerce-db"
+database_id = "YOUR_DATABASE_ID_HERE" # We will replace this later when we create the DB
