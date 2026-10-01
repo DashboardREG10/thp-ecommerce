@@ -149,6 +149,7 @@ function initDB() {
 }
 
 async function saveLargeData(key, data, progressCallback = null) {
+    let savedToCloud = false;
     try {
         const chunkSize = 200;
         const totalChunks = Math.ceil(data.length / chunkSize);
@@ -168,22 +169,63 @@ async function saveLargeData(key, data, progressCallback = null) {
                 progressCallback(Math.round(((i + 1) / totalChunks) * 100));
             }
         }
-        return true;
+        savedToCloud = true;
     } catch (e) {
-        console.error("Save Error:", e);
-        alert('เกิดข้อผิดพลาดในการบันทึกข้อมูลลงฐานข้อมูล Cloudflare: ' + e.message);
-        return false;
+        console.warn("Cloudflare Save Error (Fallback to Local):", e);
+        if (e.message.includes('exceeded') || e.message.includes('limit') || e.message.includes('D1_ERROR')) {
+            alert('โควต้าฐานข้อมูลระบบส่วนกลาง (Cloudflare D1) เต็มแล้วสำหรับวันนี้ ระบบจะทำการบันทึกข้อมูลแบบออฟไลน์ (ใช้งานได้เฉพาะบนเครื่องนี้เท่านั้น) ข้อมูลส่วนกลางจะไม่ได้รับการอัปเดต');
+        } else {
+            alert('เกิดข้อผิดพลาดในการเชื่อมต่อฐานข้อมูลส่วนกลาง ระบบจะบันทึกข้อมูลแบบออฟไลน์: ' + e.message);
+        }
     }
+    
+    // Always save to IndexedDB as local fallback / cache
+    try {
+        const db = await initDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            const store = tx.objectStore(STORE_NAME);
+            const req = store.put(data, 'thp_ecommerce_data');
+            req.onsuccess = () => resolve(true);
+            req.onerror = () => reject(req.error);
+        });
+    } catch (dbErr) {
+        console.error("Local IndexedDB Save Error:", dbErr);
+        if (!savedToCloud) return false;
+    }
+    
+    return true;
 }
 
 async function loadLargeData(key) {
     try {
         const response = await fetch('/api/data?t=' + Date.now(), { cache: 'no-store' });
         if (!response.ok) throw new Error('API load error');
-        return await response.json();
+        const data = await response.json();
+        
+        // Update local cache
+        try {
+            const db = await initDB();
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            tx.objectStore(STORE_NAME).put(data, 'thp_ecommerce_data');
+        } catch(e) {}
+        
+        return data;
     } catch (e) {
-        console.error("Load Error:", e);
-        return null;
+        console.warn("Cloudflare Load Error (Fallback to Local):", e);
+        // Fallback to IndexedDB
+        try {
+            const db = await initDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(STORE_NAME, 'readonly');
+                const req = tx.objectStore(STORE_NAME).get('thp_ecommerce_data');
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => reject(req.error);
+            });
+        } catch (dbErr) {
+            console.error("Local IndexedDB Load Error:", dbErr);
+            return null;
+        }
     }
 }
 
