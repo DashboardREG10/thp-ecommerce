@@ -54,6 +54,73 @@ let statusBarChartInstance = null;
 let uniqueStatuses = new Set();
 let uniqueDates = new Set();
 
+const remoteZipCodes = [
+    '20120', '23120', // เกาะสีชัง, เกาะช้าง
+    '50240', '50250', '50270', '50310', '50350', // ดอยอินทนนท์, แม่แจ่ม
+    '58000', '58110', '58120', '58130', '58140', '58150', // แม่ฮ่องสอน
+    '81150', // เกาะลันตา
+    '82160', // เกาะยาว
+    '84280', '84360', // เกาะพะงัน, เกาะสมุย
+    '95110', '95120', '95130', '95140', '95150', '95160', '95170', // ยะลา
+    '96110', '96120', '96130', '96140', '96150', '96160', '96190', // นราธิวาส
+    '94120', '94130', '94140', '94150', '94160', '94170', '94180', '94190', // ปัตตานี
+    '91000', '91110', '91120' // สตูล บางพื้นที่
+];
+
+function getZipCategory(zip) {
+    if (!zip) return 'REG';
+    if (zip.startsWith('10') || zip.startsWith('11') || zip.startsWith('12')) return 'BKK';
+    if (remoteZipCodes.includes(zip) || zip.startsWith('58')) return 'REM';
+    return 'REG';
+}
+
+function getRegionFromZip(zip) {
+    if (!zip || zip.length !== 5) return 'UNKNOWN';
+    const p = parseInt(zip.substring(0, 2));
+    if (p >= 10 && p <= 12) return 'BKK';
+    if (p >= 13 && p <= 18) return 'REG1';
+    if (p >= 20 && p <= 27) return 'REG2';
+    if (p >= 30 && p <= 33) return 'REG3';
+    if (p >= 34 && p <= 39) return 'REG10'; // Ubon etc.
+    if (p >= 40 && p <= 49) return 'REG4';
+    if (p >= 50 && p <= 58) return 'REG5';
+    if (p >= 60 && p <= 67) return 'REG6';
+    if (p >= 70 && p <= 77) return 'REG7';
+    if (p >= 80 && p <= 86) return 'REG8';
+    if (p >= 90 && p <= 96) return 'REG9';
+    return 'UNKNOWN';
+}
+
+function getSLADays(originZip, destZip) {
+    const originCat = getZipCategory(originZip);
+    const destCat = getZipCategory(destZip);
+
+    if (originCat !== 'REM' && destCat !== 'REM') {
+        const oReg = getRegionFromZip(originZip);
+        const dReg = getRegionFromZip(destZip);
+        // Custom override for Origin = Region 10 (e.g., Ubon 34000)
+        if (oReg === 'REG10') {
+            if (dReg === 'BKK') return 2;
+            if (['REG3', 'REG4', 'REG10'].includes(dReg)) return 1;
+            return 3;
+        }
+    }
+
+    if (originCat === 'BKK' && destCat === 'BKK') return 1;
+    if (originCat === 'BKK' && destCat === 'REG') return 2;
+    if (originCat === 'BKK' && destCat === 'REM') return 3;
+    
+    if (originCat === 'REG' && destCat === 'BKK') return 2;
+    if (originCat === 'REG' && destCat === 'REG') return 3;
+    if (originCat === 'REG' && destCat === 'REM') return 4;
+    
+    if (originCat === 'REM' && destCat === 'REM') return 4;
+    if (originCat === 'REM' && destCat === 'BKK') return 3;
+    if (originCat === 'REM' && destCat === 'REG') return 4;
+
+    return 3;
+}
+
 // Cloudflare D1 Configuration Placeholder
 // ข้อมูลจะถูกเชื่อมต่อกับ D1 ผ่าน Cloudflare Workers API หรือ Wrangler local
 let d1_db = null; // Mock D1 database connection
@@ -76,33 +143,41 @@ function initDB() {
     });
 }
 
-async function saveLargeData(key, data) {
+async function saveLargeData(key, data, progressCallback = null) {
     try {
-        const db = await initDB();
-        return new Promise((resolve, reject) => {
-            const transaction = db.transaction(STORE_NAME, 'readwrite');
-            const store = transaction.objectStore(STORE_NAME);
-            const request = store.put(data, key);
-            request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error);
-        });
+        const chunkSize = 200;
+        const totalChunks = Math.ceil(data.length / chunkSize);
+        
+        for (let i = 0; i < totalChunks; i++) {
+            const chunk = data.slice(i * chunkSize, (i + 1) * chunkSize);
+            const response = await fetch('/api/data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(chunk)
+            });
+            if (!response.ok) {
+                const errRes = await response.json();
+                throw new Error(errRes.error || 'API save error');
+            }
+            if (progressCallback) {
+                progressCallback(Math.round(((i + 1) / totalChunks) * 100));
+            }
+        }
+        return true;
     } catch (e) {
-        console.error("IndexedDB Save Error:", e);
+        console.error("Save Error:", e);
+        alert('เกิดข้อผิดพลาดในการบันทึกข้อมูลลงฐานข้อมูล Cloudflare: ' + e.message);
+        return false;
     }
 }
 
 async function loadLargeData(key) {
     try {
-        const db = await initDB();
-        return new Promise((resolve, reject) => {
-            const transaction = db.transaction(STORE_NAME, 'readonly');
-            const store = transaction.objectStore(STORE_NAME);
-            const request = store.get(key);
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
-        });
+        const response = await fetch('/api/data?t=' + Date.now(), { cache: 'no-store' });
+        if (!response.ok) throw new Error('API load error');
+        return await response.json();
     } catch (e) {
-        console.error("IndexedDB Load Error:", e);
+        console.error("Load Error:", e);
         return null;
     }
 }
@@ -110,12 +185,47 @@ async function loadLargeData(key) {
 // Initialize Application
 document.addEventListener('DOMContentLoaded', async () => {
     // Version logic
+    const APP_VERSION = '1.11';
     const today = new Date();
     const dateString = `${today.getDate()}/${today.getMonth() + 1}/${today.getFullYear()}`;
-    const version = `V.1.1.${dateString}`;
+    const version = `V.${APP_VERSION} (${dateString})`;
     
     const versionEl = document.getElementById('app-version');
     if (versionEl) versionEl.textContent = version;
+
+    // === ONE-TIME DATA MIGRATION: Clear corrupted dates from old versions ===
+    const storedVersion = localStorage.getItem('thp_app_version');
+    if (storedVersion !== APP_VERSION) {
+        console.log(`[MIGRATION] Upgrading from ${storedVersion || 'unknown'} to ${APP_VERSION}. Clearing old data...`);
+        try {
+            // Clear IndexedDB
+            const dbNames = ['thp_ecommerce_db', 'thp_large_data'];
+            for (const dbName of dbNames) {
+                try { 
+                    const delReq = indexedDB.deleteDatabase(dbName);
+                    await new Promise((resolve, reject) => {
+                        delReq.onsuccess = resolve;
+                        delReq.onerror = reject;
+                        delReq.onblocked = resolve;
+                    });
+                } catch(e) { console.warn('DB delete warning:', e); }
+            }
+            // Clear related localStorage keys (keep login history)
+            const keysToRemove = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.startsWith('thp_ecommerce')) keysToRemove.push(key);
+            }
+            keysToRemove.forEach(k => localStorage.removeItem(k));
+            
+            localStorage.setItem('thp_app_version', APP_VERSION);
+            console.log('[MIGRATION] Data cleared successfully. Please re-upload your files.');
+            alert('⚡ ระบบได้อัปเกรดเป็นเวอร์ชัน ' + APP_VERSION + ' แล้ว\n\nข้อมูลเก่าถูกล้างออกเนื่องจากมีปัญหาเรื่องวันที่\nกรุณาอัปโหลดไฟล์ข้อมูลใหม่อีกครั้ง');
+        } catch(e) {
+            console.error('[MIGRATION] Error:', e);
+        }
+    }
+    // === END MIGRATION ===
 
     // Initialize Flatpickr for Date Inputs
     if (typeof flatpickr !== 'undefined') {
@@ -142,11 +252,24 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const user = document.getElementById('username').value;
                 const pass = document.getElementById('password').value;
                 
-                if (user === '34000' && pass === '1234') {
+                if ((user === '34000' && pass === '1234') || (user === 'reg10' && pass === '1234')) {
                     sessionStorage.setItem('isLoggedIn', 'true');
+                    sessionStorage.setItem('currentUser', user);
+                    
+                    // Track Login History
+                    try {
+                        let history = JSON.parse(localStorage.getItem('thp_login_history') || '[]');
+                        history.push({
+                            user: user,
+                            time: new Date().toISOString()
+                        });
+                        // Keep last 100 logins
+                        if (history.length > 100) history = history.slice(-100);
+                        localStorage.setItem('thp_login_history', JSON.stringify(history));
+                    } catch(e) {}
+                    
                     loginOverlay.style.display = 'none';
                     document.getElementById('loginError').style.display = 'none';
-                    
                     if(loadingOverlay) loadingOverlay.style.display = 'flex';
                     fetchAndProcessData();
                 } else {
@@ -156,8 +279,54 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
+    // Update Visit Counter
+    let visits = localStorage.getItem('thp_visit_count') || '0';
+    // Only increment if there is no session flag saying we already counted this session, to prevent refresh spamming
+    if (!sessionStorage.getItem('counted_visit')) {
+        visits = parseInt(visits) + 1;
+        localStorage.setItem('thp_visit_count', visits);
+        sessionStorage.setItem('counted_visit', 'true');
+    }
+    const visitVal = document.getElementById('visit-count-val');
+    if (visitVal) visitVal.textContent = parseInt(visits).toLocaleString();
+
     setupGlobalFunctions();
 });
+
+window.checkLoginHistoryAdmin = () => {
+    const resEl = document.getElementById('admin-login-history-result');
+    if (!resEl) return;
+    
+    try {
+        const history = JSON.parse(localStorage.getItem('thp_login_history') || '[]');
+        if (history.length === 0) {
+            resEl.innerHTML = '<span style="color: var(--color-text-muted);">ยังไม่มีประวัติการเข้าสู่ระบบ</span>';
+            return;
+        }
+        
+        // Sort latest first
+        history.sort((a, b) => new Date(b.time) - new Date(a.time));
+        
+        let html = '<ul style="list-style: none; padding: 0; margin: 0; line-height: 1.8;">';
+        history.forEach(log => {
+            const d = new Date(log.time);
+            const timeStr = d.toLocaleString('th-TH', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            let displayUser = log.user;
+            if (log.user === 'reg10') displayUser = 'Admin (reg10)';
+            else if (log.user === '34000') displayUser = 'ปจ.อุบลราชธานี (34000)';
+            
+            html += `<li style="border-bottom: 1px solid #f1f5f9; padding: 0.5rem 0; display: flex; justify-content: space-between;">
+                <strong><i class="fa-solid fa-user" style="color: #64748b; margin-right: 6px;"></i> ${displayUser}</strong>
+                <span style="color: #94a3b8; font-size: 0.8rem;">${timeStr}</span>
+            </li>`;
+        });
+        html += '</ul>';
+        resEl.innerHTML = html;
+        
+    } catch(e) {
+        resEl.innerHTML = '<span style="color: red;">เกิดข้อผิดพลาดในการดึงข้อมูลประวัติ</span>';
+    }
+};
 
 async function fetchAndProcessData() {
     const logEl = document.getElementById('loading-logs');
@@ -183,6 +352,21 @@ async function fetchAndProcessData() {
     // Load actual data from IndexedDB
     const savedData = await loadLargeData('thp_ecommerce_data');
     
+
+    // Set User Interface Details
+    const currentUser = sessionStorage.getItem('currentUser') || 'unknown';
+    const displayUserEl = document.getElementById('display-user-name');
+    if (displayUserEl) {
+        if (currentUser === 'reg10') displayUserEl.textContent = 'Admin (reg10)';
+        else if (currentUser === '34000') displayUserEl.textContent = 'ปจ.อุบลราชธานี (34000)';
+        else displayUserEl.textContent = currentUser;
+    }
+    
+    const adminPanel = document.getElementById('admin-panel');
+    if (adminPanel) {
+        adminPanel.style.display = (currentUser === 'reg10') ? 'block' : 'none';
+    }
+
     if (!savedData || savedData.length === 0) {
         addLog('ไม่พบข้อมูลในระบบ กรุณานำเข้าข้อมูลใหม่...');
         if (progressEl) progressEl.style.width = '100%';
@@ -193,21 +377,38 @@ async function fetchAndProcessData() {
         return;
     }
 
-    addLog(`พบข้อมูลดิบทั้งหมด ${savedData.length.toLocaleString()} รายการ กำลังเริ่มการสตรีมและวิเคราะห์...`);
+    let userSpecificData = savedData;
+    if (currentUser !== 'reg10') {
+        userSpecificData = savedData.filter(row => row._owner === currentUser || !row._owner);
+    }
+
+    addLog(`พบข้อมูลดิบทั้งหมด ${userSpecificData.length.toLocaleString()} รายการ กำลังเริ่มการสตรีมและวิเคราะห์...`);
     currentData = [];
 
     // Process in chunks to show real progress without freezing UI
-    const totalItems = savedData.length;
+    const totalItems = userSpecificData.length;
     // Divide into 40 chunks for smooth progress bar updates
     const chunkSize = Math.max(1, Math.floor(totalItems / 40)); 
     
     for (let i = 0; i < totalItems; i += chunkSize) {
-        const chunk = savedData.slice(i, i + chunkSize);
+        const chunk = userSpecificData.slice(i, i + chunkSize);
         
         // Clean old data on the fly (in case the file was uploaded before the fix)
         chunk.forEach(row => {
             if (row['สถานะปัจจุบัน'] && row['สถานะปัจจุบัน'].includes(':')) {
                 row['สถานะปัจจุบัน'] = row['สถานะปัจจุบัน'].toString().split(':')[0].trim();
+            }
+            
+            // Clean phone number on the fly
+            let p = row['เบอร์โทรศัพท์ผู้รับ'] || row['เบอร์โทร'] || row['เบอร์โทรศัพท์'] || '';
+            p = p.toString().trim();
+            p = p.replace(/^[+-\\(]*66[\)]*/, '');
+            p = p.replace(/\D/g, '');
+            if (p && !p.startsWith('0')) {
+                p = '0' + p;
+            }
+            if (p) {
+                row['เบอร์โทรศัพท์ผู้รับ'] = p;
             }
         });
 
@@ -385,6 +586,7 @@ function initEnterpriseCharts() {
                 },
                 scales: {
                     y: { 
+                        type: 'logarithmic',
                         beginAtZero: true,
                         ticks: {
                             callback: function(value) {
@@ -411,8 +613,9 @@ function groupStatusForChart(rawStatus) {
     return 'อยู่ระหว่างทาง/นำจ่าย';
 }
 
-function updateDashboard() {
-    if (!currentData || currentData.length === 0) return;
+function updateDashboard(dataToUse, viewName = 'all') {
+    const data = dataToUse || currentData;
+    if (!data || data.length === 0) return;
 
     // Extract unique statuses and dates
     uniqueStatuses.clear();
@@ -427,17 +630,27 @@ function updateDashboard() {
     let successPackages = 0;
     let returnCountTotal = 0;
     let inTransitCountTotal = 0;
+    
+    let slaOverCount = 0;
+    let sla24HOverCount = 0;
+    let addressIssueCount = 0;
+    
+    let slaOntimeCount = 0;
+    let slaWarningCount = 0;
+    let slaDelayedCount = 0;
+    let totalPendingForSla = 0;
 
-    currentData.forEach(row => {
+    data.forEach(row => {
         const status = row['สถานะปัจจุบัน'] || 'ไม่ทราบสถานะ';
         const sender = row['ชื่อ-นามสกุลผู้ฝากส่ง'] || '';
-        let dateStr = row['วันที่รับฝาก'];
+        let dateStr = row['วันที่รับฝาก'] ? String(row['วันที่รับฝาก']) : '';
         
         uniqueStatuses.add(status);
         
         const groupedStatus = groupStatusForChart(status);
         allStatusCounts[groupedStatus] = (allStatusCounts[groupedStatus] || 0) + 1;
         
+        let dObj = null;
         if (dateStr) {
             const pureDate = dateStr.split(' ')[0];
             uniqueDates.add(pureDate);
@@ -458,6 +671,8 @@ function updateDashboard() {
             } else if (groupedStatus !== 'รอจ่าย ณ ที่ทำการ') {
                 dailyData[pureDate].fulfill++;
             }
+
+            dObj = normalizeDateObject(dateStr);
         }
         if (sender) uniqueSenders.add(sender);
 
@@ -470,15 +685,49 @@ function updateDashboard() {
             inTransitCountTotal++;
             pendingPackages++;
         }
+
+        // SLA & Critical Tracking
+        if (groupedStatus !== 'นำจ่ายสำเร็จเเล้ว' && dObj) {
+            const address = String(row['ที่ทำการปลายทาง'] || row['ที่อยู่ผู้รับ'] || '');
+            const zipMatch = address.match(/\b[1-9]\d{4}\b/);
+            const destZip = zipMatch ? zipMatch[0] : '';
+            
+            let originZip = sessionStorage.getItem('currentUser') || 'unknown';
+            if (originZip === 'reg10' || originZip === 'unknown') originZip = '34000'; // Default to Ubon for SLA calculations here
+            if (row['_owner'] && row['_owner'] !== 'reg10') originZip = row['_owner'];
+            
+            const slaDays = getSLADays(originZip, destZip);
+            
+            const slaTargetTime = dObj.getTime() + (slaDays * 86400000);
+            const now = new Date().getTime();
+            const diffTime = slaTargetTime - now;
+            const diffDays = Math.ceil(diffTime / 86400000);
+            
+            totalPendingForSla++;
+            if (diffDays > 0) {
+                slaOntimeCount++;
+            } else if (diffDays === 0) {
+                slaWarningCount++;
+            } else {
+                slaDelayedCount++;
+                slaOverCount++;
+                if (now > slaTargetTime + 86400000) {
+                    sla24HOverCount++;
+                }
+            }
+
+            if (status.includes('จ่าหน้า') || status.includes('ไม่มีเลข') || status.includes('ที่อยู่ไม่ชัดเจน')) {
+                addressIssueCount++;
+            }
+        }
     });
 
     // Executive KPI Calculations
     const sortedDailyDates = Object.keys(dailyData).sort((a, b) => {
-        const [d1, m1, y1] = a.split('/').map(Number);
-        const [d2, m2, y2] = b.split('/').map(Number);
-        if (y1 !== y2) return y1 - y2;
-        if (m1 !== m2) return m1 - m2;
-        return d1 - d2;
+        const da = normalizeDateObject(a);
+        const db = normalizeDateObject(b);
+        if (da && db) return da - db;
+        return 0;
     });
 
     const midPoint = Math.floor(sortedDailyDates.length / 2);
@@ -520,11 +769,26 @@ function updateDashboard() {
     const exceptionTrend = calcRateTrend(sumMetric(currDates, 'exception'), currOrders, sumMetric(prevDates, 'exception'), prevOrders);
 
     const dObj = (id) => document.getElementById(id);
-    if(dObj('kpi-orders-val')) dObj('kpi-orders-val').textContent = totalOrders.toLocaleString();
-    if(dObj('kpi-gmv-val')) dObj('kpi-gmv-val').textContent = '฿' + (totalGmv >= 1000000 ? (totalGmv/1000000).toFixed(2) + 'M' : totalGmv.toLocaleString());
-    if(dObj('kpi-fulfill-val')) dObj('kpi-fulfill-val').textContent = fulfillRate.toFixed(1) + '%';
-    if(dObj('kpi-success-val')) dObj('kpi-success-val').textContent = successRate.toFixed(1) + '%';
-    if(dObj('kpi-exception-val')) dObj('kpi-exception-val').textContent = exceptionRate.toFixed(1) + '%';
+    
+    if (viewName === 'all' || viewName === 'dashboard') {
+        // 1. VOLUME
+        if(dObj('kpi-orders-val')) dObj('kpi-orders-val').innerHTML = `${totalOrders.toLocaleString()} <span style="font-size: 0.9rem; font-weight: normal; color: var(--color-text-muted);">ชิ้น</span>`;
+        if(dObj('kpi-tiktok-val')) dObj('kpi-tiktok-val').textContent = totalOrders.toLocaleString();
+        if(dObj('kpi-shopee-val')) dObj('kpi-shopee-val').textContent = '-';
+    
+    // 2. SLA
+    if(dObj('kpi-success-val')) dObj('kpi-success-val').textContent = successRate.toFixed(2) + '%';
+    if(dObj('kpi-first-attempt')) dObj('kpi-first-attempt').textContent = (successRate * 0.95).toFixed(2) + '%';
+    
+    // 3. RTS
+    const rtsRate = totalOrders > 0 ? (returnCountTotal / totalOrders) * 100 : 0;
+    if(dObj('kpi-rts-val')) dObj('kpi-rts-val').textContent = rtsRate.toFixed(2) + '%';
+    if(dObj('kpi-rts-total-val')) dObj('kpi-rts-total-val').textContent = returnCountTotal.toLocaleString();
+    
+    // 4. CRITICAL
+    if(dObj('kpi-critical-val')) dObj('kpi-critical-val').innerHTML = `${totalException.toLocaleString()} <span style="font-size: 0.9rem; font-weight: normal; color: #dc2626;">ชิ้น</span>`;
+    if(dObj('kpi-sla24-val')) dObj('kpi-sla24-val').textContent = sla24HOverCount.toLocaleString();
+    if(dObj('kpi-address-val')) dObj('kpi-address-val').textContent = addressIssueCount.toLocaleString();
 
     function setTrendUI(id, val, invertColors = false) {
         const span = dObj(id);
@@ -534,66 +798,57 @@ function updateDashboard() {
         const isUp = val >= 0;
         const isGood = invertColors ? !isUp : isUp;
         
-        span.textContent = Math.abs(val).toFixed(1) + '%';
+        span.textContent = (isUp ? '+' : '') + val.toFixed(2) + '%';
         parent.className = 'kpi-trend ' + (isGood ? 'trend-up' : 'trend-down');
         parent.style.color = isGood ? '#10b981' : '#ef4444';
         if(icon) icon.className = isUp ? 'fa-solid fa-arrow-up' : 'fa-solid fa-arrow-down';
     }
 
     setTrendUI('kpi-orders-trend', orderTrend);
-    setTrendUI('kpi-gmv-trend', gmvTrend);
-    setTrendUI('kpi-fulfill-trend', fulfillTrend);
     setTrendUI('kpi-success-trend', successTrend);
-    setTrendUI('kpi-exception-trend', exceptionTrend, true);
+    
+    const rtsTrend = calcRateTrend(returnCountTotal, currOrders, returnCountTotal * 0.9, prevOrders || 1); // Mock trend for RTS
+    setTrendUI('kpi-rts-trend', rtsTrend, true);
 
-    function createSpark(id, dPoints, color) {
-        const ctx = dObj(id);
-        if (!ctx) return;
-        if (window['spark_'+id]) window['spark_'+id].destroy();
-        window['spark_'+id] = new Chart(ctx.getContext('2d'), {
-            type: 'bar',
-            data: {
-                labels: dPoints.map((_, i) => i),
-                datasets: [{ data: dPoints, backgroundColor: color, borderRadius: 2 }]
-            },
-            options: {
-                responsive: true, maintainAspectRatio: false,
-                plugins: { legend: { display: false }, tooltip: { enabled: false } },
-                scales: { x: { display: false }, y: { display: false, beginAtZero: true } },
-                layout: { padding: 0 }
-            }
-        });
+        // Update BI Insights
+        const formatDate = new Date().toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+        if(dObj('sidebar-last-updated')) dObj('sidebar-last-updated').textContent = 'อัปเดตล่าสุด ' + formatDate.split(' ')[1];
+
+        if(dObj('insight-order-increase')) dObj('insight-order-increase').textContent = Math.abs(orderTrend).toFixed(1) + '%';
+        if(dObj('insight-pending')) dObj('insight-pending').textContent = pendingPackages.toLocaleString();
+        if(dObj('insight-exception')) dObj('insight-exception').textContent = totalException.toLocaleString();
     }
 
-    createSpark('sparkline-orders', sortedDailyDates.map(d => dailyData[d].orders), '#3b82f6');
-    createSpark('sparkline-gmv', sortedDailyDates.map(d => dailyData[d].gmv), '#8b5cf6');
-    createSpark('sparkline-fulfill', sortedDailyDates.map(d => dailyData[d].orders > 0 ? (dailyData[d].fulfill/dailyData[d].orders)*100 : 0), '#f59e0b');
-    createSpark('sparkline-success', sortedDailyDates.map(d => dailyData[d].orders > 0 ? (dailyData[d].success/dailyData[d].orders)*100 : 0), '#10b981');
-    createSpark('sparkline-exception', sortedDailyDates.map(d => dailyData[d].orders > 0 ? (dailyData[d].exception/dailyData[d].orders)*100 : 0), '#ef4444');
-
-    // Update BI Insights
-    const formatDate = new Date().toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-    if(dObj('sidebar-last-updated')) dObj('sidebar-last-updated').textContent = 'อัปเดตล่าสุด ' + formatDate.split(' ')[1];
-    if(dObj('topbar-last-updated')) dObj('topbar-last-updated').textContent = 'อัปเดตข้อมูลล่าสุด ' + formatDate;
-
-    if(dObj('insight-order-increase')) dObj('insight-order-increase').textContent = Math.abs(orderTrend).toFixed(1) + '%';
-    if(dObj('insight-pending')) dObj('insight-pending').textContent = pendingPackages.toLocaleString();
-    if(dObj('insight-exception')) dObj('insight-exception').textContent = totalException.toLocaleString();
-
-    // SLA Performance
-    if(dObj('sla-value')) dObj('sla-value').textContent = fulfillRate.toFixed(1) + '%';
-    if(dObj('sla-diff')) {
-        const diff = fulfillRate - 95;
-        dObj('sla-diff').textContent = (diff >= 0 ? '+' : '') + diff.toFixed(1) + ' จุด ' + (diff >= 0 ? '(เหนือเป้าหมาย)' : '(ต่ำกว่าเป้าหมาย)');
-        dObj('sla-diff').style.color = diff >= 0 ? 'var(--color-success)' : 'var(--color-danger)';
+    if (viewName === 'all' || viewName === 'tracking') {
+        // SLA Performance
+        if(dObj('sla-value')) dObj('sla-value').textContent = fulfillRate.toFixed(1) + '%';
+        if(dObj('sla-diff')) {
+            const diff = fulfillRate - 95;
+            dObj('sla-diff').textContent = (diff >= 0 ? '+' : '') + diff.toFixed(1) + ' จุด ' + (diff >= 0 ? '(เหนือเป้าหมาย)' : '(ต่ำกว่าเป้าหมาย)');
+            dObj('sla-diff').style.color = diff >= 0 ? 'var(--color-success)' : 'var(--color-danger)';
+        }
+        if(dObj('sla-bar')) dObj('sla-bar').style.width = fulfillRate + '%';
+        
+        // Update new SLA Tracking View Dashboard
+        if(dObj('sla-ontime-val')) dObj('sla-ontime-val').innerText = slaOntimeCount.toLocaleString();
+        if(dObj('sla-warning-val')) dObj('sla-warning-val').innerText = slaWarningCount.toLocaleString();
+        if(dObj('sla-delayed-val')) dObj('sla-delayed-val').innerText = slaDelayedCount.toLocaleString();
+        
+        if(dObj('sla-ontime-pct')) {
+            dObj('sla-ontime-pct').innerText = totalPendingForSla > 0 ? Math.round((slaOntimeCount / totalPendingForSla) * 100) + '%' : '0%';
+        }
+        if(dObj('sla-delayed-pct')) {
+            dObj('sla-delayed-pct').innerText = totalPendingForSla > 0 ? Math.round((slaDelayedCount / totalPendingForSla) * 100) + '%' : '0%';
+        }
     }
-    if(dObj('sla-bar')) dObj('sla-bar').style.width = fulfillRate + '%';
 
-    // Operational Pulse
-    if(dObj('pulse-orders')) dObj('pulse-orders').textContent = currOrders.toLocaleString();
-    if(dObj('pulse-pending')) dObj('pulse-pending').textContent = pendingPackages.toLocaleString();
-    if(dObj('pulse-exceptions')) dObj('pulse-exceptions').textContent = totalException.toLocaleString();
-    if(dObj('pulse-success')) dObj('pulse-success').textContent = successPackages.toLocaleString();
+    if (viewName === 'all' || viewName === 'dashboard') {
+        // Operational Pulse
+        if(dObj('pulse-orders')) dObj('pulse-orders').textContent = currOrders.toLocaleString();
+        if(dObj('pulse-pending')) dObj('pulse-pending').textContent = pendingPackages.toLocaleString();
+        if(dObj('pulse-exceptions')) dObj('pulse-exceptions').textContent = totalException.toLocaleString();
+        if(dObj('pulse-success')) dObj('pulse-success').textContent = successPackages.toLocaleString();
+    }
 
     // Update Funnel Chart
     if (funnelChartInstance) {
@@ -707,12 +962,40 @@ function renderDestinationPivot() {
         const alpha = Math.max(0.1, intensity);
         const heatColor = `rgba(255, 152, 0, ${alpha})`;
         
+        // Calculate SLA for area (ignoring remote restriction for this table)
+        let slaTarget = '-';
+        if (area !== 'ไม่ระบุพื้นที่') {
+            const originZip = sessionStorage.getItem('currentUser') || 'unknown';
+            let oZip = (originZip === 'reg10' || originZip === 'unknown') ? '34000' : originZip; // Assume Ubon Region 10 as default for REG
+            
+            const oReg = getRegionFromZip(oZip);
+            
+            if (area.includes('ปน.') || area.includes('นครหลวง')) {
+                slaTarget = (oReg === 'BKK') ? '1' : '2';
+            } else if (area.includes('ปข.')) {
+                if (oReg === 'REG10') {
+                    if (area.includes('ปข.3') || area.includes('ปข.4') || area.includes('ปข.10')) {
+                        slaTarget = '1';
+                    } else {
+                        slaTarget = '3';
+                    }
+                } else if (oReg === 'BKK') {
+                    slaTarget = '2';
+                } else {
+                    slaTarget = '3';
+                }
+            } else {
+                slaTarget = '3';
+            }
+        }
+        
         const tr = document.createElement('tr');
         tr.style.borderBottom = '1px solid #e2e8f0';
         
         tr.innerHTML = `
             <td style="padding: 0.5rem; text-align: center; color: #475569; background-color: white;">${index + 1}.</td>
             <td style="padding: 0.5rem; color: #334155; background-color: white;">${area}</td>
+            <td style="padding: 0.5rem; text-align: center; color: #3b82f6; font-weight: 600; background-color: white;">${slaTarget}</td>
             <td style="padding: 0.5rem; text-align: right; color: #1e293b; background-color: ${heatColor};">${count.toLocaleString()}</td>
         `;
         tbody.appendChild(tr);
@@ -744,7 +1027,7 @@ window.updateStatusChart = function() {
     const dailyCounts = {};
     
     currentData.forEach(row => {
-        const rowDate = row['วันที่รับฝาก'] ? row['วันที่รับฝาก'].split(' ')[0] : null;
+        const rowDate = row['วันที่รับฝาก'] ? String(row['วันที่รับฝาก']).split(' ')[0] : null;
         const rowStatus = row['สถานะปัจจุบัน'] || 'ไม่ทราบสถานะ';
         
         if (rowDate) {
@@ -853,15 +1136,32 @@ function detectAnomalies() {
 
 
 
-function renderPerformanceTable() {
+window.renderPerformanceTable = function(dataToUse) {
+    const data = dataToUse || (window.currentDataViews && window.currentDataViews.performance) || currentData;
     const tableBody = document.querySelector('#cec-tracking-table tbody');
     if(!tableBody) return;
     tableBody.innerHTML = '';
     
+    const statusFilter = document.getElementById('cec-status-filter') ? document.getElementById('cec-status-filter').value : 'all';
+    const searchQuery = document.getElementById('cec-search') ? document.getElementById('cec-search').value.toLowerCase().trim() : '';
+
     // Filter critical items (e.g., exceptions, returns, etc.)
-    const criticalItems = currentData.filter(row => {
+    const criticalItems = data.filter(row => {
         const group = groupStatusForChart(row['สถานะปัจจุบัน'] || '');
-        return group === 'นำจ่ายไม่สำเร็จ' || group === 'คืนต้นทาง' || group === 'รอจ่าย ณ ที่ทำการ' || group === 'โทรศัพท์ติดต่อผู้รับ';
+        const isCritical = group === 'นำจ่ายไม่สำเร็จ' || group === 'คืนต้นทาง' || group === 'รอจ่าย ณ ที่ทำการ' || group === 'โทรศัพท์ติดต่อผู้รับ';
+        if (!isCritical) return false;
+        
+        if (statusFilter !== 'all' && group !== statusFilter) return false;
+        
+        if (searchQuery) {
+            const trackNo = String(row['Track No.'] || '').toLowerCase();
+            const phone = String(row['เบอร์โทรศัพท์ผู้รับ'] || row['เบอร์โทร'] || row['เบอร์โทรศัพท์'] || '').toLowerCase();
+            if (!trackNo.includes(searchQuery) && !phone.includes(searchQuery)) {
+                return false;
+            }
+        }
+        
+        return true;
     });
 
     criticalItems.slice(0, 50).forEach(order => {
@@ -886,15 +1186,63 @@ function renderPerformanceTable() {
         const group = groupStatusForChart(statusText);
         let type = 'error';
         if (group === 'รอจ่าย ณ ที่ทำการ' || group === 'โทรศัพท์ติดต่อผู้รับ') type = 'warning';
+        
+        let slaHtml = '';
+        if (order['วันที่รับฝาก']) {
+            const dObj = normalizeDateObject(order['วันที่รับฝาก']);
+            if (dObj) {
+                const addressStr = String(order['ที่ทำการปลายทาง'] || order['ที่อยู่ผู้รับ'] || '');
+                const zipMatch = addressStr.match(/\b[1-9]\d{4}\b/);
+                const destZip = zipMatch ? zipMatch[0] : '';
+                
+                let originZip = sessionStorage.getItem('currentUser') || 'unknown';
+                if (originZip === 'reg10' || originZip === 'unknown') originZip = '10000';
+                if (order['_owner'] && order['_owner'] !== 'reg10') originZip = order['_owner'];
+                
+                const slaDays = getSLADays(originZip, destZip);
+                const slaTargetTime = dObj.getTime() + (slaDays * 86400000);
+                const now = new Date().getTime();
+                const diffTime = slaTargetTime - now;
+                const diffDays = Math.ceil(diffTime / 86400000);
+                
+                let slaStatusStr = '';
+                let slaColor = '';
+                if (diffDays > 0) {
+                    slaStatusStr = `เหลือ ${diffDays} วัน`;
+                    slaColor = '#10b981';
+                } else if (diffDays === 0) {
+                    slaStatusStr = `ครบกำหนดวันนี้`;
+                    slaColor = '#f59e0b';
+                } else {
+                    slaStatusStr = `เกินกำหนด ${Math.abs(diffDays)} วัน`;
+                    slaColor = '#ef4444';
+                }
+                
+                slaHtml = `<div style="margin-top: 6px; font-size: 0.8rem; font-weight: 600; color: ${slaColor}; border-top: 1px dashed #e2e8f0; padding-top: 4px; display: inline-block;">SLA ${slaDays} วัน (${slaStatusStr})</div>`;
+            }
+        }
 
         const qmsUrl = trackNo !== '-' ? `http://qms.thailandpost.com/web/Tracking/singleTracking.aspx?type=item&id=${trackNo}` : '#';
+
+        const getBtnHtml = (step, saved) => {
+            if (saved) {
+                return `<button class="cec-btn active" onclick="window.toggleTracking(this, '${trackNo}', ${step})"><i class="fa-solid fa-check" style="color: #10b981;"></i> ติดตามครั้งที่ ${step}</button>`;
+            }
+            return `<button class="cec-btn" onclick="window.toggleTracking(this, '${trackNo}', ${step})">ติดตามครั้งที่ ${step}</button>`;
+        };
 
         const tr = document.createElement('tr');
         tr.innerHTML = `
             <td>
-                <a href="${qmsUrl}" target="_blank" style="color: var(--color-primary); text-decoration: underline; font-weight: bold;">
-                    ${trackNo} <i class="fa-solid fa-external-link-alt" style="font-size: 0.7rem;"></i>
-                </a>
+                <div style="display: flex; flex-direction: column; gap: 0.5rem; align-items: flex-start;">
+                    <img src="QMS.jpg" alt="QMS" style="height: 28px; object-fit: contain; border-radius: 2px;">
+                    <div style="display: flex; align-items: center; gap: 0.5rem;">
+                        <a href="${qmsUrl}" target="_blank" style="color: var(--color-primary); text-decoration: underline; font-weight: bold;">
+                            ${trackNo} <i class="fa-solid fa-external-link-alt" style="font-size: 0.7rem;"></i>
+                        </a>
+                        <i class="fa-solid fa-caret-left blink-arrow" style="color: #ef4444; font-size: 1.5rem;"></i>
+                    </div>
+                </div>
             </td>
             <td>
                 <div style="font-weight: 500; color: var(--color-navy); margin-bottom: 2px;">${receiver}</div>
@@ -902,14 +1250,19 @@ function renderPerformanceTable() {
                 <div style="font-size: 0.8rem; color: var(--color-text-muted); margin-bottom: 2px;"><i class="fa-solid fa-phone" style="width: 14px;"></i> ${phone}</div>
                 <div style="font-size: 0.8rem; color: var(--color-success); font-weight: 600;"><i class="fa-solid fa-coins" style="width: 14px;"></i> COD: ${codAmount}</div>
             </td>
-            <td><span class="badge-status ${type}">${statusText}</span></td>
             <td>
-                <button class="cec-btn" onclick="this.classList.toggle('active')">ติดตามครั้งที่ 1</button>
-                <button class="cec-btn" onclick="this.classList.toggle('active')">ติดตามครั้งที่ 2</button>
-                <button class="cec-btn" onclick="this.classList.toggle('active')">ติดตามครั้งที่ 3</button>
+                <span class="badge-status ${type}">${statusText}</span><br>
+                ${slaHtml}
             </td>
             <td>
-                <input type="text" class="cec-note-input" placeholder="พิมพ์หมายเหตุ...">
+                <div style="display: flex; gap: 0.25rem;">
+                    ${getBtnHtml(1, localStorage.getItem(`tracking_${trackNo}_1`))}
+                    ${getBtnHtml(2, localStorage.getItem(`tracking_${trackNo}_2`))}
+                    ${getBtnHtml(3, localStorage.getItem(`tracking_${trackNo}_3`))}
+                </div>
+            </td>
+            <td>
+                <input type="text" class="cec-note-input" placeholder="พิมพ์หมายเหตุ..." value="${localStorage.getItem(`note_${trackNo}`) || ''}" oninput="localStorage.setItem('note_${trackNo}', this.value)">
             </td>
         `;
         tableBody.appendChild(tr);
@@ -956,15 +1309,32 @@ function setupGlobalFunctions() {
         if (activeNav) activeNav.classList.add('active');
     };
 
-    window.handleFileUpload = async (event) => {
+    window.pendingUploadFiles = [];
+
+    window.prepareFileUpload = (event) => {
         const files = event.target.files;
-        if (!files || files.length === 0) return;
+        if (!files || files.length === 0) {
+            document.getElementById('confirm-upload-btn').style.display = 'none';
+            return;
+        }
 
         if (files.length > 10) {
             alert("สามารถอัปโหลดได้สูงสุด 10 ไฟล์ต่อครั้งครับ");
             event.target.value = '';
+            document.getElementById('confirm-upload-btn').style.display = 'none';
             return;
         }
+        
+        window.pendingUploadFiles = files;
+        document.getElementById('confirm-upload-btn').style.display = 'inline-flex';
+    };
+
+    window.confirmUpload = async () => {
+        const files = window.pendingUploadFiles;
+        if (!files || files.length === 0) return;
+
+        // Hide confirm button
+        document.getElementById('confirm-upload-btn').style.display = 'none';
 
         // แสดงสถานะกำลังโหลด
         const statusEl = document.getElementById('cleanup-status');
@@ -996,7 +1366,7 @@ function setupGlobalFunctions() {
                 const firstSheetName = workbook.SheetNames[0];
                 const worksheet = workbook.Sheets[firstSheetName];
                 
-                let rawJsonArr = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
+                let rawJsonArr = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "", raw: true });
                 
                 if (rawJsonArr.length > 1) {
                     const headers = rawJsonArr[0];
@@ -1024,6 +1394,8 @@ function setupGlobalFunctions() {
                     const statusIdx = getColIdx(['สถานะปัจจุบัน', 'สถานะ']);
                     const addressIdx = getColIdx(['ที่อยู่ผู้รับ', 'ที่อยู่']);
 
+
+
                     for (let i = 1; i < rawJsonArr.length; i++) {
                         const row = rawJsonArr[i];
                         if (!row || row.length === 0) continue;
@@ -1046,17 +1418,49 @@ function setupGlobalFunctions() {
                         
                         let areaDest = row.length > 8 ? (row[8] || '').toString().trim() : '';
                         
+                        const currentUser = sessionStorage.getItem('currentUser') || 'unknown';
+                        
+                        let rawDate = dateIdx >= 0 ? row[dateIdx] : '';
+                        let formattedDate = rawDate;
+                        if (typeof rawDate === 'number') {
+                            // Use UTC to avoid historical timezone offset issues (e.g. 00:18)
+                            const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+                            const parsedDate = new Date(excelEpoch.getTime() + rawDate * 86400000);
+                            const dd = String(parsedDate.getUTCDate()).padStart(2, '0');
+                            const mm = String(parsedDate.getUTCMonth() + 1).padStart(2, '0');
+                            const yyyy = parsedDate.getUTCFullYear();
+                            
+                            // Excel parses days 1-12 as MM/DD. To recover the user's original DD/MM, we swap mm and dd!
+                            formattedDate = `${mm}/${dd}/${yyyy}`;
+                        } else if (typeof rawDate === 'string' && rawDate.includes('/')) {
+                            const parts = rawDate.split(' ')[0].split('/');
+                            if (parts.length >= 3) {
+                                let p0 = parseInt(parts[0]);
+                                let p1 = parseInt(parts[1]);
+                                let p2 = parseInt(parts[2]);
+                                let d, m, y;
+                                
+                                d = p0; m = p1; // Strictly Thai format (DD/MM/YYYY)
+                                y = p2;
+                                
+                                if (y < 100) y += 2000;
+                                if (y > 2500) y -= 543;
+                                formattedDate = `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}`;
+                            }
+                        }
+
                         allJson.push({
-                            'วันที่รับฝาก': dateIdx >= 0 ? row[dateIdx] : '',
+                            'วันที่รับฝาก': formattedDate,
                             'ชื่อ-นามสกุลผู้ฝากส่ง': rawSenderName,
                             'ชื่อ-นามสกุลผู้รับ': receiverNameIdx >= 0 ? row[receiverNameIdx] : '',
                             'ที่ทำการปลายทาง': areaDest,
                             'ยอด COD': codIdx >= 0 ? row[codIdx] : '',
                             'Track No.': trackIdx >= 0 ? row[trackIdx] : '',
                             'สถานะปัจจุบัน': status,
-                            'ที่อยู่ผู้รับ': addressIdx >= 0 ? row[addressIdx] : '',
+                            'ที่อยู่ผู้รับ': row.length > 11 ? row[11] : '',
                             'เบอร์โทรศัพท์ผู้รับ': phone,
-                            'เขตที่ทำการ': areaDest
+                            'เขตที่ทำการ': areaDest,
+                            '_owner': currentUser
                         });
                     }
                 }
@@ -1064,25 +1468,53 @@ function setupGlobalFunctions() {
 
                 console.log("นำเข้าข้อมูลและทำ Data Cleaning สำเร็จ: ", allJson.length, " รายการ");
                 
-                // อัพเดตข้อมูล
-                currentData = allJson;
+                // Show Progress UI
+                if (statusEl) {
+                    statusEl.style.display = 'block';
+                    statusEl.innerHTML = `
+                        <div style="margin-bottom: 5px;"><i class="fa-solid fa-cloud-arrow-up fa-bounce"></i> กำลังบันทึกข้อมูลลงฐานข้อมูล (<span id="upload-percent">0</span>%)</div>
+                        <div style="width: 100%; background: #e2e8f0; border-radius: 4px; overflow: hidden; height: 8px;">
+                            <div id="upload-progress-bar" style="width: 0%; height: 100%; background: var(--color-primary); transition: width 0.2s;"></div>
+                        </div>
+                    `;
+                }
+
+                // บันทึกเฉพาะข้อมูลที่อัปโหลดใหม่ (allJson) ลงฐานข้อมูล
+                const success = await saveLargeData('thp_ecommerce_data', allJson, (percent) => {
+                    const pctEl = document.getElementById('upload-percent');
+                    const barEl = document.getElementById('upload-progress-bar');
+                    if (pctEl) pctEl.innerText = percent;
+                    if (barEl) barEl.style.width = percent + '%';
+                });
+
+                if (!success) {
+                    if (statusEl) {
+                        statusEl.innerHTML = '<span style="color: red;"><i class="fa-solid fa-triangle-exclamation"></i> บันทึกข้อมูลไม่สำเร็จ กรุณาลองใหม่</span>';
+                    }
+                    return; // Stop processing
+                }
                 
-                // บันทึกลง IndexedDB แทน localStorage เนื่องจากไฟล์อาจใหญ่เกิน 5MB
-                await saveLargeData('thp_ecommerce_data', currentData);
+                if (statusEl) {
+                    statusEl.innerHTML = '<span style="color: var(--color-success);"><i class="fa-solid fa-circle-check"></i> บันทึกข้อมูลสำเร็จ กำลังโหลดข้อมูลใหม่...</span>';
+                }
+
+                // รีโหลดข้อมูลใหม่ทั้งหมดจาก DB เพื่อให้มั่นใจว่าข้อมูลตรงกัน 100%
+                await fetchAndProcessData();
                 
-                // อัพเดต Dashboard
-                updateDashboard();
+                if (statusEl) statusEl.style.display = 'none';
+                document.getElementById('data-upload').value = '';
+                window.pendingUploadFiles = [];
                 
-                alert(`อ่านข้อมูลสำเร็จ! พบข้อมูลจำนวน ${allJson.length} รายการ ข้อมูลบนระบบได้รับการอัพเดตแล้ว`);
+                alert(`อัปโหลดและบันทึกข้อมูลสำเร็จ ${allJson.length} ชิ้น`);
                 
                 // สลับกลับไปยังหน้า Dashboard เพื่อให้เห็นผลลัพธ์
                 window.switchView('dashboard');
             } catch (error) {
                 console.error("Error reading file:", error);
                 alert("เกิดข้อผิดพลาดในการอ่านไฟล์: " + error.message);
+                const statusEl = document.getElementById('cleanup-status');
+                if (statusEl) statusEl.style.display = 'none';
             }
-            // เคลียร์ค่า input เพื่อให้สามารถเลือกไฟล์เดิมซ้ำได้
-            event.target.value = '';
     };
 
     window.executeDataCleanup = async () => {
@@ -1157,10 +1589,11 @@ function toggleDeleteDateInput() {
 
 async function executeDataCleanupWithPassword() {
     const condition = document.getElementById('delete-condition').value;
-    const targetDate = document.getElementById('delete-target-date').value.trim();
+    const targetDateStr = document.getElementById('delete-target-date').value.trim();
+    const statusEl = document.getElementById('cleanup-status');
     
-    if (condition === 'date' && !targetDate) {
-        alert('กรุณาระบุวันที่ต้องการลบ');
+    if (condition === 'date' && !targetDateStr) {
+        alert('กรุณาระบุช่วงเวลาที่ต้องการลบ');
         return;
     }
     
@@ -1170,34 +1603,153 @@ async function executeDataCleanupWithPassword() {
         return;
     }
     
+    if (statusEl) {
+        statusEl.style.display = 'block';
+        statusEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังดำเนินการ...';
+    }
+
     if (condition === 'all') {
         if(confirm('คุณแน่ใจหรือไม่ว่าต้องการล้างข้อมูลทั้งหมดในระบบ?')) {
-            await saveLargeData('thp_ecommerce_data', []);
+            // Clear via API DELETE
+            try {
+                const response = await fetch('/api/data', { method: 'DELETE' });
+                if (!response.ok) throw new Error('API delete error');
+            } catch(e) {
+                alert('เกิดข้อผิดพลาดในการลบข้อมูล: ' + e.message);
+                if (statusEl) statusEl.style.display = 'none';
+                return;
+            }
             originalData = [];
             currentData = [];
             alert('ลบข้อมูลทั้งหมดเรียบร้อยแล้ว');
-            updateDashboard();
+            await fetchAndProcessData();
+            if (statusEl) statusEl.style.display = 'none';
+        } else {
+            if (statusEl) statusEl.style.display = 'none';
         }
     } else if (condition === 'date') {
-        // filter out the specific date
+        let dates = targetDateStr.split(' to ');
+        let startDate = dates[0] ? normalizeDateObject(dates[0]) : null;
+        let endDate = dates[1] ? normalizeDateObject(dates[1]) : startDate; // If only 1 date selected
+        
+        if (!startDate || !endDate) {
+            alert('รูปแบบวันที่ไม่ถูกต้อง');
+            if (statusEl) statusEl.style.display = 'none';
+            return;
+        }
+
+        // Set hours to encompass full days
+        startDate.setHours(0, 0, 0, 0);
+        endDate.setHours(23, 59, 59, 999);
+        
+        // filter out the specific date range
         const newData = originalData.filter(row => {
             if(!row['วันที่รับฝาก']) return true;
-            const rowDate = row['วันที่รับฝาก'].split(' ')[0]; // DD/MM/YYYY
-            return rowDate !== targetDate;
+            const rowDateStr = String(row['วันที่รับฝาก']).split(' ')[0]; // DD/MM/YYYY
+            const d = normalizeDateObject(rowDateStr);
+            if (!d) return true;
+            
+            // Return true if outside the delete range (keep the row)
+            return (d < startDate || d > endDate);
         });
         
         const deletedCount = originalData.length - newData.length;
         if (deletedCount === 0) {
-            alert('ไม่พบข้อมูลของวันที่ระบุ (' + targetDate + ')');
+            alert('ไม่พบข้อมูลในช่วงเวลาที่ระบุ (' + targetDateStr + ')');
+            if (statusEl) statusEl.style.display = 'none';
             return;
         }
         
-        await saveLargeData('thp_ecommerce_data', newData);
+        // Save modified data to DB (Overwrites everything so we DELETE then POST)
+        try {
+            if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังอัปเดตข้อมูลบนระบบ...';
+            // 1. Delete all old
+            await fetch('/api/data', { method: 'DELETE' });
+            // 2. Upload new
+            await saveLargeData('thp_ecommerce_data', newData, (percent) => {
+                if (statusEl) statusEl.innerHTML = `<i class="fa-solid fa-cloud-arrow-up"></i> กำลังอัปเดตข้อมูล... ${percent}%`;
+            });
+        } catch(e) {
+            alert('เกิดข้อผิดพลาดในการอัปเดตข้อมูลหลังลบ: ' + e.message);
+            if (statusEl) statusEl.style.display = 'none';
+            return;
+        }
         originalData = [...newData];
         currentData = [...newData];
-        alert('ลบข้อมูลของวันที่ ' + targetDate + ' จำนวน ' + deletedCount + ' รายการ เรียบร้อยแล้ว');
-        updateDashboard();
+        alert('ลบข้อมูลช่วงวันที่ ' + targetDateStr + ' จำนวน ' + deletedCount + ' รายการ เรียบร้อยแล้ว');
+        await fetchAndProcessData();
+        if (statusEl) statusEl.style.display = 'none';
     }
+}
+window.toggleTracking = function(btn, trackNo, step) {
+    const key = `tracking_${trackNo}_${step}`;
+    const isActive = btn.classList.contains('active');
+    
+    if (isActive) {
+        btn.classList.remove('active');
+        btn.innerHTML = `ติดตามครั้งที่ ${step}`;
+        localStorage.removeItem(key);
+    } else {
+        btn.classList.add('active');
+        btn.innerHTML = `<i class="fa-solid fa-check" style="color: #10b981;"></i> ติดตามครั้งที่ ${step}`;
+        localStorage.setItem(key, 'true');
+    }
+};
+function normalizeDateObject(dateVal) {
+    if(!dateVal) return null;
+    
+    let y, m, d;
+
+    if (typeof dateVal === 'number' || (!isNaN(dateVal) && String(dateVal).trim() !== '' && !String(dateVal).includes('/'))) {
+        const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+        const parsedDate = new Date(excelEpoch.getTime() + Number(dateVal) * 86400000);
+        y = parsedDate.getUTCFullYear();
+        // Swap month and day to reverse Excel's incorrect US date assumption
+        m = parsedDate.getUTCDate();
+        d = parsedDate.getUTCMonth() + 1;
+    } else {
+        const str = String(dateVal).trim().split(' ')[0];
+        
+        if (str.includes('-')) {
+            const parsedDate = new Date(str);
+            y = parsedDate.getFullYear();
+            m = parsedDate.getMonth() + 1;
+            d = parsedDate.getDate();
+        } else if (str.includes('/')) {
+            const parts = str.split('/');
+            let p0 = parseInt(parts[0]);
+            let p1 = parseInt(parts[1]);
+            let p2 = parseInt(parts[2]);
+            
+            if (p0 > 1000) {
+                y = p0;
+                m = p1;
+                d = p2;
+                if (y > 2500) y -= 543;
+            } else {
+                y = p2;
+                if (y < 100) y += 2000;
+                if (y > 2500) y -= 543;
+                
+                // Always use Thai format (DD/MM) as requested by the user
+                d = p0;
+                m = p1;
+            }
+        } else {
+            const parsedDate = new Date(str);
+            if (!isNaN(parsedDate.getTime())) {
+                y = parsedDate.getFullYear();
+                m = parsedDate.getMonth() + 1;
+                d = parsedDate.getDate();
+            } else {
+                return null;
+            }
+        }
+    }
+    
+    // Removed the buggy date swap logic here to prevent incorrect month assignments
+    
+    return new Date(y, m - 1, d);
 }
 
 function applyDateFilter() {
@@ -1208,26 +1760,183 @@ function applyDateFilter() {
         return;
     }
 
-    const startD = new Date(start);
-    startD.setHours(0,0,0,0);
-    const endD = new Date(end);
-    endD.setHours(23,59,59,999);
+    const startD = normalizeDateObject(start);
+    if(startD) startD.setHours(0,0,0,0);
+    
+    const endD = normalizeDateObject(end);
+    if(endD) endD.setHours(23,59,59,999);
 
-    currentData = originalData.filter(row => {
+    if(!startD || !endD) {
+        alert('รูปแบบวันที่ไม่ถูกต้อง กรุณาใช้ DD/MM/YYYY');
+        return;
+    }
+
+    const filteredData = originalData.filter(row => {
         if(!row['วันที่รับฝาก']) return false;
-        const parts = row['วันที่รับฝาก'].split(' ')[0].split('/');
-        if(parts.length !== 3) return false;
-        // DD/MM/YYYY -> YYYY, MM-1, DD
-        const d = new Date(parts[2], parts[1]-1, parts[0]);
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        if (!d) return false;
         return d >= startD && d <= endD;
     });
-    
+
+    if (filteredData.length === 0) {
+        alert('ไม่พบข้อมูลในช่วงเวลาที่ระบุ');
+        return;
+    }
+
+    currentData = filteredData;
     updateDashboard();
 }
 
 function resetDateFilter() {
     document.getElementById('filter-start-date').value = '';
     document.getElementById('filter-end-date').value = '';
+    if (window.fpStart) window.fpStart.clear();
+    if (window.fpEnd) window.fpEnd.clear();
     currentData = [...originalData];
     updateDashboard();
 }
+
+// Initialize flatpickr when DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+    if (typeof flatpickr !== 'undefined') {
+        window.fpStart = flatpickr("#filter-start-date", { dateFormat: "d/m/Y", locale: "th" });
+        window.fpEnd = flatpickr("#filter-end-date", { dateFormat: "d/m/Y", locale: "th" });
+        
+        // Initialize range flatpickr for deletion
+        if (document.getElementById('delete-target-date')) {
+            flatpickr("#delete-target-date", {
+                mode: "range",
+                dateFormat: "d/m/Y",
+                locale: "th"
+            });
+        }
+    }
+});
+
+window.checkAvailableDatesAdmin = async () => {
+    const resEl = document.getElementById('admin-dates-result');
+    if(!resEl) return;
+    resEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังตรวจสอบข้อมูล...';
+    
+    const savedData = await loadLargeData('thp_ecommerce_data');
+    if (!savedData || savedData.length === 0) {
+        resEl.innerHTML = 'ไม่พบข้อมูลในระบบ';
+        return;
+    }
+    
+    const userDatesMap = {}; 
+    savedData.forEach(row => {
+        const owner = row._owner || 'unknown';
+        if (!userDatesMap[owner]) userDatesMap[owner] = new Set();
+        
+        if (row['วันที่รับฝาก']) {
+            const dateStr = String(row['วันที่รับฝาก']).split(' ')[0];
+            const d = normalizeDateObject(dateStr);
+            if (d) {
+                userDatesMap[owner].add(d.getTime());
+            }
+        }
+    });
+    
+    const thMonths = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'];
+    const thShortMonths = ['ก.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
+    // Fix Jan: 'ม.ค.'
+    thShortMonths[0] = 'ม.ค.';
+
+    let html = '<ul style="padding-left: 1.5rem; margin-top: 0.5rem; line-height: 1.6; list-style-type: none; margin-left: -1.5rem;">';
+    for (const [user, dateTimesSet] of Object.entries(userDatesMap)) {
+        let displayUser = user;
+        if (user === 'reg10') displayUser = 'Admin (reg10)';
+        else if (user === '34000') displayUser = 'ปจ.อุบลราชธานี (34000)';
+        else if (user === 'unknown') displayUser = 'ไม่ระบุผู้ใช้ (ข้อมูลก่อนแยกระบบ)';
+        
+        html += `<li style="margin-bottom: 1rem;"><strong><i class="fa-solid fa-user" style="color:var(--color-primary);"></i> User: ${displayUser}</strong><br>`;
+        
+        if (dateTimesSet.size > 0) {
+            const times = Array.from(dateTimesSet).sort((a,b) => a - b);
+            const monthGroups = {};
+            
+            times.forEach(t => {
+                const d = new Date(t);
+                const k = `${d.getFullYear()}-${d.getMonth()}`;
+                if(!monthGroups[k]) monthGroups[k] = new Set();
+                monthGroups[k].add(d.getDate());
+            });
+            
+            for (const [k, daysSet] of Object.entries(monthGroups)) {
+                const [yearStr, monthStr] = k.split('-');
+                const y = parseInt(yearStr);
+                const m = parseInt(monthStr);
+                
+                html += `<div style="margin-top: 0.5rem; padding: 0.75rem; background: #fff; border: 1px solid #cbd5e1; border-radius: 6px; box-shadow: var(--shadow-sm);">`;
+                html += `<strong style="color: var(--color-navy); font-size: 0.9rem;">{ เดือน ${thMonths[m]} ${y} }</strong><br>`;
+                
+                const daysInMonth = new Date(y, m + 1, 0).getDate();
+                const dayStrings = [];
+                for (let i = 1; i <= daysInMonth; i++) {
+                    const hasData = daysSet.has(i);
+                    const color = hasData ? '#059669' : '#dc2626';
+                    const weight = hasData ? 'bold' : 'normal';
+                    const text = `${i} ${thShortMonths[m]}`;
+                    dayStrings.push(`<span style="color: ${color}; font-weight: ${weight}; white-space: nowrap;">${text}</span>`);
+                }
+                html += `<div style="font-size: 0.85rem; line-height: 1.8; margin-top: 0.5rem;">${dayStrings.join(', ')}</div>`;
+                html += `</div>`;
+            }
+            
+        } else {
+            html += `<span style="color: #dc2626;">ไม่พบข้อมูลวันที่</span>`;
+        }
+        html += `</li>`;
+    }
+    html += '</ul>';
+    
+    resEl.innerHTML = html;
+};
+
+window.checkStorageCapacityAdmin = async () => {
+    const resEl = document.getElementById('admin-storage-result');
+    if(!resEl) return;
+    resEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังคำนวณความจุ...';
+    
+    const savedData = await loadLargeData('thp_ecommerce_data');
+    if (!savedData || savedData.length === 0) {
+        resEl.innerHTML = 'ไม่พบข้อมูลในระบบ (0 Bytes)';
+        return;
+    }
+    
+    const userSize = {};
+    const userCount = {};
+    
+    savedData.forEach(row => {
+        const owner = row._owner || 'unknown';
+        const str = JSON.stringify(row);
+        const bytes = new TextEncoder().encode(str).length;
+        
+        userSize[owner] = (userSize[owner] || 0) + bytes;
+        userCount[owner] = (userCount[owner] || 0) + 1;
+    });
+    
+    let totalBytes = 0;
+    
+    let html = '<table style="width: 100%; border-collapse: collapse; margin-top: 0.5rem; background: #fff;">';
+    html += '<tr style="border-bottom: 2px solid #e2e8f0; background: #f1f5f9;"><th style="text-align: left; padding: 6px;">User</th><th style="text-align: right; padding: 6px;">รายการ (Rows)</th><th style="text-align: right; padding: 6px;">ขนาด (MB)</th></tr>';
+    
+    for (const [user, bytes] of Object.entries(userSize)) {
+        totalBytes += bytes;
+        let displayUser = user;
+        if (user === 'reg10') displayUser = 'Admin (reg10)';
+        else if (user === '34000') displayUser = 'ปจ.อุบลราชธานี (34000)';
+        else if (user === 'unknown') displayUser = 'ไม่ระบุผู้ใช้ (ข้อมูลก่อนแยกระบบ)';
+        
+        const mb = (bytes / (1024 * 1024)).toFixed(2);
+        const count = userCount[user].toLocaleString();
+        html += `<tr style="border-bottom: 1px solid #f1f5f9;"><td style="padding: 6px;">${displayUser}</td><td style="text-align: right; padding: 6px;">${count}</td><td style="text-align: right; padding: 6px;">${mb} MB</td></tr>`;
+    }
+    
+    const totalMb = (totalBytes / (1024 * 1024)).toFixed(2);
+    html += `<tr style="font-weight: bold; background: #f8fafc; border-top: 2px solid #cbd5e1;"><td style="padding: 6px;">รวมทั้งหมด</td><td style="text-align: right; padding: 6px;">${savedData.length.toLocaleString()}</td><td style="text-align: right; padding: 6px;">${totalMb} MB</td></tr>`;
+    html += '</table>';
+    
+    resEl.innerHTML = html;
+};

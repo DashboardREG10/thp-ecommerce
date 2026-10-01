@@ -1,4 +1,4 @@
-name = "e-commerce-system"
+name = "thp-e-commerce-system"
 compatibility_date = "2024-03-20"
 pages_build_output_dir = "."
 
@@ -6,4 +6,4 @@ pages_build_output_dir = "."
 [[d1_databases]]
 binding = "DB"
 database_name = "ecommerce-db"
-database_id = "YOUR_DATABASE_ID_HERE" # We will replace this later when we create the DB
+database_id = "94338c96-2fdc-493e-a32e-d4b3a0401ae2"
