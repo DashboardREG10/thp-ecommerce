@@ -1,0 +1,29 @@
+{
+  "routes": [
+    {
+      "routePath": "/api/data",
+      "mountPath": "/api",
+      "method": "DELETE",
+      "module": [
+        "api/data.js:onRequestDelete"
+      ]
+    },
+    {
+      "routePath": "/api/data",
+      "mountPath": "/api",
+      "method": "GET",
+      "module": [
+        "api/data.js:onRequestGet"
+      ]
+    },
+    {
+      "routePath": "/api/data",
+      "mountPath": "/api",
+      "method": "POST",
+      "module": [
+        "api/data.js:onRequestPost"
+      ]
+    }
+  ],
+  "baseURL": "/"
+}

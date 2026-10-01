@@ -47,6 +47,11 @@ const mockChartData = {
 
 let originalData = [];
 let currentData = [];
+window.currentDataViews = {
+    dashboard: null,
+    tracking: null,
+    performance: null
+};
 let mainChartInstance = null;
 let performanceChartInstance = null;
 let funnelChartInstance = null;
@@ -228,10 +233,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // === END MIGRATION ===
 
     // Initialize Flatpickr for Date Inputs
-    if (typeof flatpickr !== 'undefined') {
-        flatpickr("#filter-start-date", { dateFormat: "d/m/Y", locale: "th" });
-        flatpickr("#filter-end-date", { dateFormat: "d/m/Y", locale: "th" });
-    }
+    // Removed duplicate flatpickr init here, now only done on DOMContentLoaded
 
     // Initialize Enterprise Chart instances
     initEnterpriseCharts();
@@ -1752,9 +1754,12 @@ function normalizeDateObject(dateVal) {
     return new Date(y, m - 1, d);
 }
 
-function applyDateFilter() {
-    const start = document.getElementById('filter-start-date').value;
-    const end = document.getElementById('filter-end-date').value;
+window.applyDateFilter = function(viewName = 'dashboard') {
+    const startId = `filter-start-${viewName}`;
+    const endId = `filter-end-${viewName}`;
+    const start = document.getElementById(startId) ? document.getElementById(startId).value : '';
+    const end = document.getElementById(endId) ? document.getElementById(endId).value : '';
+    
     if(!start || !end) {
         alert('กรุณาเลือกช่วงเวลาให้ครบทั้งเริ่มต้นและสิ้นสุด');
         return;
@@ -1783,24 +1788,53 @@ function applyDateFilter() {
         return;
     }
 
-    currentData = filteredData;
-    updateDashboard();
+    window.currentDataViews[viewName] = filteredData;
+    
+    // Only update the global currentData if we are on dashboard (backward compatibility)
+    if (viewName === 'dashboard') {
+        currentData = filteredData;
+    }
+    
+    updateDashboard(filteredData, viewName);
 }
 
-function resetDateFilter() {
-    document.getElementById('filter-start-date').value = '';
-    document.getElementById('filter-end-date').value = '';
-    if (window.fpStart) window.fpStart.clear();
-    if (window.fpEnd) window.fpEnd.clear();
-    currentData = [...originalData];
-    updateDashboard();
+window.resetDateFilter = function(viewName = 'dashboard') {
+    const startId = `filter-start-${viewName}`;
+    const endId = `filter-end-${viewName}`;
+    if(document.getElementById(startId)) document.getElementById(startId).value = '';
+    if(document.getElementById(endId)) document.getElementById(endId).value = '';
+    
+    if (window.fpInstances && window.fpInstances[viewName]) {
+        window.fpInstances[viewName].start.clear();
+        window.fpInstances[viewName].end.clear();
+    }
+    
+    window.currentDataViews[viewName] = null;
+    if (viewName === 'dashboard') {
+        currentData = [...originalData];
+    }
+    
+    updateDashboard(originalData, viewName);
 }
+
+// Global flatpickr instances tracker
+window.fpInstances = {
+    dashboard: { start: null, end: null },
+    tracking: { start: null, end: null },
+    performance: { start: null, end: null }
+};
 
 // Initialize flatpickr when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
     if (typeof flatpickr !== 'undefined') {
-        window.fpStart = flatpickr("#filter-start-date", { dateFormat: "d/m/Y", locale: "th" });
-        window.fpEnd = flatpickr("#filter-end-date", { dateFormat: "d/m/Y", locale: "th" });
+        ['dashboard', 'tracking', 'performance'].forEach(view => {
+            const sId = `#filter-start-${view}`;
+            const eId = `#filter-end-${view}`;
+            if(document.querySelector(sId) && document.querySelector(eId)) {
+                window.fpInstances[view].start = flatpickr(sId, { dateFormat: "d/m/Y", locale: "th" });
+                window.fpInstances[view].end = flatpickr(eId, { dateFormat: "d/m/Y", locale: "th" });
+            }
+        });
         
         // Initialize range flatpickr for deletion
         if (document.getElementById('delete-target-date')) {
@@ -1812,6 +1846,125 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 });
+
+// === Timeline and Heatmap Logic ===
+window.updateTimeline = function() {
+    const month = parseInt(document.getElementById('timeline-month-filter').value);
+    const data = window.currentDataViews.dashboard || currentData || originalData;
+    
+    // Filter data for the specific month
+    const monthData = data.filter(row => {
+        if(!row['วันที่รับฝาก']) return false;
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        return d && (d.getMonth() + 1) === month;
+    });
+
+    // Group into 4 weeks
+    const weeks = [ { s:0, r:0, t:0 }, { s:0, r:0, t:0 }, { s:0, r:0, t:0 }, { s:0, r:0, t:0 } ];
+    
+    monthData.forEach(row => {
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        const date = d.getDate();
+        let weekIdx = 0;
+        if(date <= 7) weekIdx = 0;
+        else if(date <= 14) weekIdx = 1;
+        else if(date <= 21) weekIdx = 2;
+        else weekIdx = 3;
+        
+        weeks[weekIdx].t++;
+        const status = row['สถานะปัจจุบัน'] || '';
+        if(status.includes('จัดส่งสำเร็จ')) weeks[weekIdx].s++;
+        else if(status.includes('คืน') || status.includes('นำจ่ายไม่สำเร็จ') || status.includes('รอส่งคืน')) weeks[weekIdx].r++;
+    });
+
+    for(let i=1; i<=4; i++) {
+        const w = weeks[i-1];
+        let succPct = 0; let retPct = 0;
+        if (w.t > 0) {
+            succPct = Math.round((w.s / w.t) * 100);
+            retPct = Math.round((w.r / w.t) * 100);
+        }
+        if(document.getElementById(`tl-w${i}-success`)) document.getElementById(`tl-w${i}-success`).innerText = succPct;
+        if(document.getElementById(`tl-w${i}-return`)) document.getElementById(`tl-w${i}-return`).innerText = retPct;
+    }
+};
+
+window.updateHeatmap = function() {
+    const month = parseInt(document.getElementById('heatmap-month-filter').value);
+    const container = document.getElementById('heatmap-container');
+    if(!container) return;
+    
+    const data = window.currentDataViews.dashboard || currentData || originalData;
+    const monthData = data.filter(row => {
+        if(!row['วันที่รับฝาก']) return false;
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        return d && (d.getMonth() + 1) === month;
+    });
+
+    const originMap = {};
+    monthData.forEach(row => {
+        let origin = row._owner || '34000'; // Fallback to 34000
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        const day = d.getDate();
+        
+        if(!originMap[origin]) originMap[origin] = {};
+        if(!originMap[origin][day]) originMap[origin][day] = 0;
+        originMap[origin][day]++;
+    });
+
+    let maxVal = 0;
+    Object.values(originMap).forEach(days => {
+        Object.values(days).forEach(v => {
+            if(v > maxVal) maxVal = v;
+        });
+    });
+
+    let html = '<table style="width: 100%; border-collapse: separate; border-spacing: 2px;">';
+    // Header (Days 1-31)
+    html += '<tr><th style="text-align: right; padding-right: 10px; color: var(--color-navy); font-size: 0.85rem; width: 100px;">ฝั่งต้นทาง \\ วันที่</th>';
+    for(let d=1; d<=31; d++) {
+        html += `<th style="text-align: center; font-size: 0.75rem; color: #64748b; font-weight: normal; width: 22px;">${d}</th>`;
+    }
+    html += '</tr>';
+
+    for(const origin in originMap) {
+        let originName = origin;
+        if(origin === 'reg10') originName = 'ปข.10';
+        else if(origin === '34000') originName = 'ปจ.อุบลฯ';
+        else originName = origin;
+
+        html += `<tr><td style="text-align: right; padding-right: 10px; font-size: 0.8rem; font-weight: 600; color: var(--color-navy);">${originName}</td>`;
+        for(let d=1; d<=31; d++) {
+            const val = originMap[origin][d] || 0;
+            let bgColor = '#fef2f2'; // Very light red
+            if (val === 0) bgColor = '#f8fafc'; // Empty/Grey
+            else if (maxVal > 0) {
+                const pct = val / maxVal;
+                if(pct > 0.75) bgColor = '#991b1b'; // Dark Red
+                else if(pct > 0.5) bgColor = '#ef4444'; // Red
+                else if(pct > 0.25) bgColor = '#fca5a5'; // Light Red
+            }
+            const tooltip = val > 0 ? ` title="วันที่ ${d}: ${val} ชิ้น"` : '';
+            html += `<td style="background-color: ${bgColor}; height: 22px; border-radius: 2px;"${tooltip}></td>`;
+        }
+        html += '</tr>';
+    }
+    if (Object.keys(originMap).length === 0) {
+        html += `<tr><td colspan="32" style="text-align: center; padding: 2rem; color: #94a3b8; font-size: 0.85rem;">ไม่พบข้อมูลในเดือนนี้</td></tr>`;
+    }
+    html += '</table>';
+    container.innerHTML = html;
+};
+
+// Add call to update dashboard
+const originalUpdateDashboard = updateDashboard;
+window.updateDashboard = function(dataToUse, viewName) {
+    originalUpdateDashboard(dataToUse, viewName);
+    if (!viewName || viewName === 'dashboard' || viewName === 'all') {
+        updateTimeline();
+        updateHeatmap();
+    }
+};
 
 window.checkAvailableDatesAdmin = async () => {
     const resEl = document.getElementById('admin-dates-result');
