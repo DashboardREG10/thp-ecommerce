@@ -1,7 +1,57 @@
 export async function onRequestGet(context) {
-    const { env } = context;
+    const { env, request } = context;
     try {
-        const { results } = await env.DB.prepare('SELECT * FROM shipments').all();
+        const url = new URL(request.url);
+        const owner = url.searchParams.get('owner');
+        const since = url.searchParams.get('since');
+        const countOnly = url.searchParams.get('count_only');
+
+        // Count-only mode: return just the row count (very cheap - 1 row read)
+        if (countOnly === 'true') {
+            let countQuery = 'SELECT COUNT(*) as total FROM shipments';
+            const params = [];
+            if (owner) {
+                countQuery += ' WHERE owner = ?';
+                params.push(owner);
+            }
+            const stmt = params.length > 0
+                ? env.DB.prepare(countQuery).bind(...params)
+                : env.DB.prepare(countQuery);
+            const { results } = await stmt.all();
+            return new Response(JSON.stringify({ total: results[0].total }), {
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // Build filtered query
+        let query = 'SELECT * FROM shipments';
+        const conditions = [];
+        const params = [];
+
+        if (owner) {
+            conditions.push('owner = ?');
+            params.push(owner);
+        }
+
+        if (since) {
+            // Incremental sync: only fetch rows updated after the given timestamp
+            conditions.push('updated_at > ?');
+            params.push(since);
+        }
+
+        if (conditions.length > 0) {
+            query += ' WHERE ' + conditions.join(' AND ');
+        }
+
+        // Add ORDER BY for consistent results
+        query += ' ORDER BY updated_at DESC';
+
+        const stmt = params.length > 0
+            ? env.DB.prepare(query).bind(...params)
+            : env.DB.prepare(query);
+
+        const { results } = await stmt.all();
+
         // Convert to the JSON format app.js expects
         const allJson = results.map(row => ({
             'วันที่รับฝาก': row.date_received,
@@ -16,7 +66,11 @@ export async function onRequestGet(context) {
             'เขตที่ทำการ': row.area,
             '_owner': row.owner
         }));
-        return new Response(JSON.stringify(allJson), {
+
+        // Include server timestamp for incremental sync
+        const serverTime = new Date().toISOString();
+
+        return new Response(JSON.stringify({ data: allJson, serverTime: serverTime }), {
             headers: { 'Content-Type': 'application/json' }
         });
     } catch (e) {

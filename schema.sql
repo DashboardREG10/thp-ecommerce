@@ -13,3 +13,10 @@ CREATE TABLE shipments (
     owner TEXT,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Indexes for reducing Full Table Scan and Rows Read quota
+CREATE INDEX IF NOT EXISTS idx_shipments_owner ON shipments(owner);
+CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(current_status);
+CREATE INDEX IF NOT EXISTS idx_shipments_date ON shipments(date_received);
+CREATE INDEX IF NOT EXISTS idx_shipments_updated ON shipments(updated_at);
+CREATE INDEX IF NOT EXISTS idx_shipments_owner_updated ON shipments(owner, updated_at);

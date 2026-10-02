@@ -56,6 +56,9 @@ let mainChartInstance = null;
 let performanceChartInstance = null;
 let funnelChartInstance = null;
 let statusBarChartInstance = null;
+let statusDonutChartInstance = null;
+let forecastChartInstance = null;
+let dailyVolumeChartInstance = null;
 let uniqueStatuses = new Set();
 let uniqueDates = new Set();
 
@@ -198,22 +201,108 @@ async function saveLargeData(key, data, progressCallback = null) {
 }
 
 async function loadLargeData(key) {
+    const currentUser = sessionStorage.getItem('currentUser') || 'unknown';
+    
+    // Try to get cached data and last sync time from IndexedDB first
+    let cachedData = null;
+    let lastSyncTime = null;
     try {
-        const response = await fetch('/api/data?t=' + Date.now(), { cache: 'no-store' });
-        if (!response.ok) throw new Error('API load error');
-        const data = await response.json();
+        const db = await initDB();
+        cachedData = await new Promise((resolve, reject) => {
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const req = tx.objectStore(STORE_NAME).get('thp_ecommerce_data');
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error);
+        });
+        lastSyncTime = await new Promise((resolve, reject) => {
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const req = tx.objectStore(STORE_NAME).get('thp_last_sync_time');
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error);
+        });
+    } catch(e) {
+        console.warn("IndexedDB read error:", e);
+    }
+
+    try {
+        let apiUrl = '/api/data?t=' + Date.now();
         
-        // Update local cache
+        // If we have cached data AND a last sync time, do incremental sync
+        if (cachedData && cachedData.length > 0 && lastSyncTime) {
+            apiUrl += '&since=' + encodeURIComponent(lastSyncTime);
+            console.log(`[Incremental Sync] Fetching changes since: ${lastSyncTime}`);
+        } else {
+            console.log('[Full Sync] No cache found, fetching all data...');
+        }
+        
+        const response = await fetch(apiUrl, { cache: 'no-store' });
+        if (!response.ok) throw new Error('API load error');
+        const responseJson = await response.json();
+        
+        // Handle both old format (array) and new format ({ data: [], serverTime: '' })
+        let freshData, serverTime;
+        if (Array.isArray(responseJson)) {
+            // Old API format (backward compatibility)
+            freshData = responseJson;
+            serverTime = new Date().toISOString();
+        } else {
+            freshData = responseJson.data || [];
+            serverTime = responseJson.serverTime || new Date().toISOString();
+        }
+
+        let finalData;
+        if (cachedData && cachedData.length > 0 && lastSyncTime && freshData.length < (cachedData.length || 0)) {
+            // Incremental sync: merge fresh data into cached data
+            // Build a map of track_no -> index for fast lookup
+            const trackMap = new Map();
+            cachedData.forEach((item, idx) => {
+                const tNo = String(item['Track No.'] || '').trim();
+                if (tNo) trackMap.set(tNo, idx);
+            });
+            
+            let updatedCount = 0;
+            let newCount = 0;
+            freshData.forEach(item => {
+                const tNo = String(item['Track No.'] || '').trim();
+                if (!tNo) return;
+                if (trackMap.has(tNo)) {
+                    // Update existing row
+                    cachedData[trackMap.get(tNo)] = item;
+                    updatedCount++;
+                } else {
+                    // New row
+                    cachedData.push(item);
+                    newCount++;
+                }
+            });
+            
+            console.log(`[Incremental Sync] Updated: ${updatedCount}, New: ${newCount}, Total: ${cachedData.length}`);
+            finalData = cachedData;
+        } else {
+            // Full sync: use fresh data as-is
+            console.log(`[Full Sync] Loaded ${freshData.length} rows from D1`);
+            finalData = freshData;
+        }
+        
+        // Save merged data + sync timestamp to IndexedDB
         try {
             const db = await initDB();
             const tx = db.transaction(STORE_NAME, 'readwrite');
-            tx.objectStore(STORE_NAME).put(data, 'thp_ecommerce_data');
-        } catch(e) {}
+            tx.objectStore(STORE_NAME).put(finalData, 'thp_ecommerce_data');
+            tx.objectStore(STORE_NAME).put(serverTime, 'thp_last_sync_time');
+        } catch(e) {
+            console.warn("IndexedDB cache write error:", e);
+        }
         
-        return data;
+        return finalData;
     } catch (e) {
         console.warn("Cloudflare Load Error (Fallback to Local):", e);
-        // Fallback to IndexedDB
+        // Fallback to IndexedDB cached data
+        if (cachedData && cachedData.length > 0) {
+            console.log(`[Offline] Using cached data: ${cachedData.length} rows`);
+            return cachedData;
+        }
+        // Last resort: try to read from IndexedDB directly
         try {
             const db = await initDB();
             return new Promise((resolve, reject) => {
@@ -229,10 +318,16 @@ async function loadLargeData(key) {
     }
 }
 
+
 // Initialize Application
 document.addEventListener('DOMContentLoaded', async () => {
+    // Set global chart font
+    if (typeof Chart !== 'undefined') {
+        Chart.defaults.font.family = "'IBM Plex Sans Thai Looped', sans-serif";
+    }
+    
     // Version logic
-    const APP_VERSION = '1.11';
+    const APP_VERSION = '1.40';
     const today = new Date();
     const dateString = `${today.getDate()}/${today.getMonth() + 1}/${today.getFullYear()}`;
     const version = `V.${APP_VERSION} (${dateString})`;
@@ -240,39 +335,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const versionEl = document.getElementById('app-version');
     if (versionEl) versionEl.textContent = version;
 
-    // === ONE-TIME DATA MIGRATION: Clear corrupted dates from old versions ===
-    const storedVersion = localStorage.getItem('thp_app_version');
-    if (storedVersion !== APP_VERSION) {
-        console.log(`[MIGRATION] Upgrading from ${storedVersion || 'unknown'} to ${APP_VERSION}. Clearing old data...`);
-        try {
-            // Clear IndexedDB
-            const dbNames = ['thp_ecommerce_db', 'thp_large_data'];
-            for (const dbName of dbNames) {
-                try { 
-                    const delReq = indexedDB.deleteDatabase(dbName);
-                    await new Promise((resolve, reject) => {
-                        delReq.onsuccess = resolve;
-                        delReq.onerror = reject;
-                        delReq.onblocked = resolve;
-                    });
-                } catch(e) { console.warn('DB delete warning:', e); }
-            }
-            // Clear related localStorage keys (keep login history)
-            const keysToRemove = [];
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                if (key && key.startsWith('thp_ecommerce')) keysToRemove.push(key);
-            }
-            keysToRemove.forEach(k => localStorage.removeItem(k));
-            
-            localStorage.setItem('thp_app_version', APP_VERSION);
-            console.log('[MIGRATION] Data cleared successfully. Please re-upload your files.');
-            alert('⚡ ระบบได้อัปเกรดเป็นเวอร์ชัน ' + APP_VERSION + ' แล้ว\n\nข้อมูลเก่าถูกล้างออกเนื่องจากมีปัญหาเรื่องวันที่\nกรุณาอัปโหลดไฟล์ข้อมูลใหม่อีกครั้ง');
-        } catch(e) {
-            console.error('[MIGRATION] Error:', e);
-        }
-    }
-    // === END MIGRATION ===
+    // Just update the version in local storage without clearing data
+    localStorage.setItem('thp_app_version', APP_VERSION);
 
     // Initialize Flatpickr for Date Inputs
     // Removed duplicate flatpickr init here, now only done on DOMContentLoaded
@@ -495,11 +559,163 @@ async function fetchAndProcessData() {
 // Removed obsolete initChart and initStatusChart
 
 function initEnterpriseCharts() {
+    const shadowPlugin = {
+        id: 'shadowPlugin',
+        beforeDatasetsDraw: function(chart) {
+            chart.ctx.save();
+            chart.ctx.shadowColor = 'rgba(15, 23, 42, 0.2)';
+            chart.ctx.shadowBlur = 12;
+            chart.ctx.shadowOffsetX = 4;
+            chart.ctx.shadowOffsetY = 8;
+        },
+        afterDatasetsDraw: function(chart) {
+            chart.ctx.restore();
+        }
+    };
+
+    const forecastLabelsPlugin = {
+        id: 'forecastLabelsPlugin',
+        afterDatasetsDraw(chart, args, options) {
+            const { ctx, data } = chart;
+            ctx.save();
+            ctx.font = 'bold 10px "IBM Plex Sans Thai Looped", sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            
+            data.datasets.forEach((dataset, i) => {
+                if (i !== 0 && i !== 1) return;
+                
+                const meta = chart.getDatasetMeta(i);
+                if (!meta.hidden) {
+                    meta.data.forEach((element, index) => {
+                        const val = dataset.data[index];
+                        if (val === null || val === undefined) return;
+                        
+                        let text = val.toLocaleString();
+                        
+                        if (i === 1) { // Forecast
+                            // Don't label the connection point (which is part of actual data timeframe)
+                            if (index < chart.data.labels.length - 30) return;
+                            
+                            const thousands = Math.floor(val / 1000);
+                            if (thousands > 0) {
+                                text = thousands.toLocaleString() + ',XXX';
+                            } else {
+                                text = val.toString().charAt(0) + 'XX';
+                            }
+                            ctx.fillStyle = '#ed1c24';
+                        } else {
+                            ctx.fillStyle = '#475569';
+                        }
+
+                        const position = element.tooltipPosition();
+                        ctx.fillText(text, position.x, position.y - 8);
+                    });
+                }
+            });
+
+            // Draw campaign annotations
+            if (chart.config.campaignAnnotations) {
+                chart.config.campaignAnnotations.forEach(anno => {
+                    const datasetIndex = 1; // Forecast dataset
+                    const meta = chart.getDatasetMeta(datasetIndex);
+                    const element = meta.data[anno.index];
+                    if (!element || meta.hidden) return;
+                    
+                    const pos = element.tooltipPosition();
+                    
+                    // Stagger heights based on campaign name
+                    let yOffset = 50;
+                    if (anno.name.includes('Double Day')) yOffset = 100;
+                    else if (anno.name.includes('เก็บตก')) yOffset = 75;
+                    else if (anno.name.includes('ปลายหาง')) yOffset = 50;
+                    else if (anno.name.includes('TikTok')) yOffset = 75;
+                    
+                    ctx.font = 'bold 12px "IBM Plex Sans Thai Looped", sans-serif'; // Bigger font
+                    const textWidth = ctx.measureText(anno.name).width;
+                    const boxWidth = textWidth + 24; // More padding
+                    const boxHeight = 26; // Taller box
+                    const boxX = pos.x - boxWidth / 2;
+                    const boxY = pos.y - yOffset; // above the data point label
+                    
+                    // Draw dashed line pointing down
+                    ctx.save();
+                    ctx.strokeStyle = '#ed1c24';
+                    ctx.lineWidth = 1.5;
+                    ctx.setLineDash([4, 4]);
+                    ctx.beginPath();
+                    ctx.moveTo(pos.x, boxY + boxHeight);
+                    ctx.lineTo(pos.x, pos.y - 12); // Stop just above the point/label
+                    ctx.stroke();
+                    ctx.restore();
+
+                    // Draw red box with white text
+                    ctx.save();
+                    ctx.shadowColor = 'rgba(237, 28, 36, 0.4)';
+                    ctx.shadowBlur = 8;
+                    ctx.shadowOffsetY = 4;
+                    ctx.fillStyle = '#ed1c24';
+                    ctx.beginPath();
+                    ctx.roundRect(boxX, boxY, boxWidth, boxHeight, 6); // slightly rounder corners
+                    ctx.fill();
+                    ctx.restore();
+                    
+                    ctx.fillStyle = '#ffffff';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(anno.name, pos.x, boxY + boxHeight / 2);
+                });
+            }
+
+            // Draw vertical line for Today
+            const splitIndex = chart.config.splitIndex;
+            if (splitIndex !== undefined) {
+                const meta0 = chart.getDatasetMeta(0);
+                const splitElement = meta0.data[splitIndex];
+                if (splitElement) {
+                    const xPos = splitElement.x;
+                    const { top, bottom } = chart.chartArea;
+                    
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.moveTo(xPos, top);
+                    ctx.lineTo(xPos, bottom);
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeStyle = '#94a3b8';
+                    ctx.setLineDash([5, 5]);
+                    ctx.stroke();
+                    
+                    const text = 'วันนี้ (LIVE CUT-OFF)';
+                    ctx.font = 'bold 11px "IBM Plex Sans Thai Looped", sans-serif';
+                    const textWidth = ctx.measureText(text).width;
+                    const boxW = textWidth + 16;
+                    const boxH = 22;
+                    const boxY = top - 15;
+                    
+                    ctx.fillStyle = '#0f172a';
+                    ctx.setLineDash([]);
+                    ctx.beginPath();
+                    ctx.roundRect(xPos - boxW/2, boxY, boxW, boxH, 4);
+                    ctx.fill();
+                    
+                    ctx.fillStyle = '#ffffff';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(text, xPos, boxY + boxH/2);
+                    ctx.restore();
+                }
+            }
+
+            ctx.restore();
+        }
+    };
+
     const perfCtx = document.getElementById('performanceChart');
     if(perfCtx) {
         performanceChartInstance = new Chart(perfCtx.getContext('2d'), {
             type: 'line',
             data: { labels: [], datasets: [] },
+            plugins: [shadowPlugin],
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
@@ -508,14 +724,50 @@ function initEnterpriseCharts() {
                     legend: { display: false }
                 },
                 scales: {
-                    y: { 
-                        beginAtZero: true,
-                        ticks: {
-                            callback: function(value) {
-                                return value >= 1000 ? (value/1000) + 'K' : value;
+                    y: { beginAtZero: true, grid: { color: '#e2e8f0' } },
+                    x: { grid: { display: false } }
+                }
+            }
+        });
+    }
+
+    const forecastCtx = document.getElementById('forecastChart');
+    if(forecastCtx) {
+        forecastChartInstance = new Chart(forecastCtx.getContext('2d'), {
+            type: 'line',
+            plugins: [shadowPlugin, forecastLabelsPlugin],
+            data: { labels: [], datasets: [] },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                layout: { padding: { top: 40, right: 30 } },
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { position: 'top', labels: { usePointStyle: true, boxWidth: 8 } },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                let label = context.dataset.label || '';
+                                if (label) label += ': ';
+                                if (context.parsed.y !== null) {
+                                    label += context.parsed.y.toLocaleString() + ' ชิ้น';
+                                }
+                                return label;
                             }
                         }
                     }
+                },
+                scales: {
+                    y: { 
+                        beginAtZero: true, 
+                        grid: { color: '#e2e8f0' }, 
+                        ticks: { 
+                            stepSize: 1000,
+                            autoSkip: false,
+                            maxTicksLimit: 20
+                        } 
+                    },
+                    x: { grid: { display: false } }
                 }
             }
         });
@@ -526,6 +778,7 @@ function initEnterpriseCharts() {
         funnelChartInstance = new Chart(funnelCtx.getContext('2d'), {
             type: 'bar',
             data: { labels: [], datasets: [] },
+            plugins: [shadowPlugin],
             options: {
                 indexAxis: 'y',
                 responsive: true,
@@ -556,7 +809,7 @@ function initEnterpriseCharts() {
         statusBarChartInstance = new Chart(statusCtx.getContext('2d'), {
             type: 'bar',
             data: { labels: [], datasets: [] },
-            plugins: [{
+            plugins: [shadowPlugin, {
                 id: 'calloutLabels',
                 afterDatasetsDraw(chart) {
                     const { ctx, data } = chart;
@@ -645,6 +898,86 @@ function initEnterpriseCharts() {
             }
         });
     }
+
+    const donutCtx = document.getElementById('statusDonutChart');
+    if (donutCtx) {
+        statusDonutChartInstance = new Chart(donutCtx.getContext('2d'), {
+            type: 'doughnut',
+            data: { labels: [], datasets: [] },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                cutout: '65%',
+                layout: {
+                    padding: 40
+                },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                return ' ' + context.label + ': ' + context.raw.toLocaleString() + ' Items';
+                            }
+                        }
+                    }
+                }
+            },
+            plugins: [shadowPlugin, {
+                id: 'doughnutLabelsLine',
+                afterDraw: function(chart) {
+                    const ctx = chart.ctx;
+                    const dataset = chart.data.datasets[0];
+                    if (!dataset || !dataset.data || dataset.data.length === 0) return;
+                    
+                    const meta = chart.getDatasetMeta(0);
+                    const total = dataset.data.reduce((sum, val) => sum + val, 0);
+                    if (total === 0) return;
+                    
+                    chart.data.labels.forEach((label, i) => {
+                        const val = dataset.data[i];
+                        if (val === 0) return;
+                        
+                        const arc = meta.data[i];
+                        const centerPoint = arc.tooltipPosition();
+                        const pct = ((val / total) * 100).toFixed(1) + '%';
+                        const text = `${label} ${pct}\n(${val.toLocaleString()})`;
+                        
+                        // Draw line
+                        ctx.beginPath();
+                        ctx.moveTo(arc.x, arc.y);
+                        
+                        const angle = (arc.startAngle + arc.endAngle) / 2;
+                        const radius = arc.outerRadius;
+                        
+                        // Pointer calculation
+                        const x = chart.chartArea.left + chart.chartArea.width / 2 + Math.cos(angle) * (radius + 15);
+                        const y = chart.chartArea.top + chart.chartArea.height / 2 + Math.sin(angle) * (radius + 15);
+                        
+                        const textX = x + (Math.cos(angle) >= 0 ? 15 : -15);
+                        
+                        ctx.lineTo(x, y);
+                        ctx.lineTo(textX, y);
+                        ctx.strokeStyle = dataset.backgroundColor[i];
+                        ctx.lineWidth = 1.5;
+                        ctx.setLineDash([2, 2]);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                        
+                        // Draw Text
+                        ctx.fillStyle = '#1e293b';
+                        ctx.font = '600 11px "Bai Jamjuree", sans-serif';
+                        ctx.textAlign = Math.cos(angle) >= 0 ? 'left' : 'right';
+                        ctx.textBaseline = 'middle';
+                        
+                        const lines = text.split('\n');
+                        lines.forEach((line, index) => {
+                            ctx.fillText(line, textX + (Math.cos(angle) >= 0 ? 5 : -5), y + (index === 0 ? -7 : 7));
+                        });
+                    });
+                }
+            }]
+        });
+    }
 }
 
 function groupStatusForChart(rawStatus) {
@@ -669,6 +1002,7 @@ function updateDashboard(dataToUse, viewName = 'all') {
     const dateCounts = {};
     const allStatusCounts = {};
     const dailyData = {};
+    window.criticalItemsData = { sla24H: [], addressIssue: [] };
 
     let pendingPackages = 0;
     let successPackages = 0;
@@ -756,12 +1090,27 @@ function updateDashboard(dataToUse, viewName = 'all') {
                 slaDelayedCount++;
                 slaOverCount++;
                 if (now > slaTargetTime + 86400000) {
-                    sla24HOverCount++;
+                    const exStatuses = [
+                        'โทรติดต่อผู้รับ',
+                        'โทรศัพท์ติดต่อผู้รับ',
+                        'ถึงศูนย์คัดแยกสินค้า/ที่ทำการ',
+                        'ส่งออกจากศูนย์คัดแยกสินค้า/ที่ทำการ',
+                        'โทรศัพท์ติดต่อผู้รับ/ผู้ฝากแล้ว ให้เก็บรอนำจ่าย',
+                        'ถึง ปณ.ปลายทาง เตรียมนำจ่าย',
+                        'อยู่ระหว่างคัดแยกสินค้า',
+                        'ปณ.ปลายทางส่งคืน',
+                        'คาดว่าจะได้รับ'
+                    ];
+                    if (!exStatuses.some(s => status.includes(s))) {
+                        sla24HOverCount++;
+                        window.criticalItemsData.sla24H.push(row);
+                    }
                 }
             }
 
             if (status.includes('จ่าหน้า') || status.includes('ไม่มีเลข') || status.includes('ที่อยู่ไม่ชัดเจน')) {
                 addressIssueCount++;
+                window.criticalItemsData.addressIssue.push(row);
             }
         }
     });
@@ -932,8 +1281,34 @@ function updateDashboard(dataToUse, viewName = 'all') {
         statusBarChartInstance.update();
     }
 
+    if (statusDonutChartInstance) {
+        const successCount = allStatusCounts['นำจ่ายสำเร็จเเล้ว'] || 0;
+        const returnCount = allStatusCounts['คืนต้นทาง'] || 0;
+        
+        statusDonutChartInstance.data.labels = ['นำจ่ายสำเร็จ', 'คืนต้นทาง'];
+        statusDonutChartInstance.data.datasets = [{
+            data: [successCount, returnCount],
+            backgroundColor: ['#10b981', '#ef4444'],
+            borderWidth: 0,
+            hoverOffset: 4
+        }];
+        statusDonutChartInstance.update();
+        
+        const dateRangeEl = document.getElementById('donut-chart-date-range');
+        if (dateRangeEl) {
+            if (sortedDailyDates && sortedDailyDates.length > 0) {
+                const start = sortedDailyDates[0];
+                const end = sortedDailyDates[sortedDailyDates.length - 1];
+                dateRangeEl.textContent = start === end ? `(${start})` : `(${start} - ${end})`;
+            } else {
+                dateRangeEl.textContent = '';
+            }
+        }
+    }
+
     setupStatusFilters();
     updateStatusChart();
+    updateForecastChart();
     detectAnomalies();
 
     // 3. Render Recent Orders/Customers (Top 10)
@@ -1098,15 +1473,180 @@ window.updateStatusChart = function() {
         label: 'Volume',
         data: dataPoints,
         borderColor: '#3b82f6',
-        backgroundColor: 'rgba(59, 130, 246, 0.1)',
-        borderWidth: 2,
+        backgroundColor: (context) => {
+            const ctx = context.chart.ctx;
+            const gradient = ctx.createLinearGradient(0, 0, 0, 300);
+            gradient.addColorStop(0, 'rgba(59, 130, 246, 0.5)');
+            gradient.addColorStop(1, 'rgba(59, 130, 246, 0.01)');
+            return gradient;
+        },
+        borderWidth: 3,
         fill: true,
         tension: 0.4,
-        pointRadius: 3,
+        pointRadius: 4,
         pointBackgroundColor: '#ffffff',
-        pointBorderColor: '#3b82f6'
+        pointBorderColor: '#3b82f6',
+        pointBorderWidth: 2
     }];
     performanceChartInstance.update();
+}
+
+window.updateForecastChart = function() {
+    if (!forecastChartInstance || !currentData) return;
+
+    const dailyCounts = {};
+    currentData.forEach(row => {
+        const rowDate = row['วันที่รับฝาก'] ? String(row['วันที่รับฝาก']).split(' ')[0] : null;
+        if (rowDate) {
+            dailyCounts[rowDate] = (dailyCounts[rowDate] || 0) + 1;
+        }
+    });
+
+    const sortedDates = Object.keys(dailyCounts).sort((a, b) => {
+        const [d1, m1, y1] = a.split('/').map(Number);
+        const [d2, m2, y2] = b.split('/').map(Number);
+        if (y1 !== y2) return y1 - y2;
+        if (m1 !== m2) return m1 - m2;
+        return d1 - d2;
+    });
+
+    // Use up to last 30 days of actual data
+    const actualDates = sortedDates.slice(-30);
+    const actualData = actualDates.map(d => dailyCounts[d]);
+    if (actualData.length === 0) return;
+
+    const forecastDays = 30;
+    const forecastDates = [];
+    const forecastData = [];
+    const upperBound = [];
+    const lowerBound = [];
+
+    let lastActualVal = actualData[actualData.length - 1];
+    const lastDateStr = actualDates[actualDates.length - 1];
+    let lastDate = new Date();
+    if (lastDateStr) {
+        const [d, m, y] = lastDateStr.split('/').map(Number);
+        // JS Date uses year, monthIndex (0-11)
+        lastDate = new Date(y < 2500 ? y : y - 543, m - 1, d);
+    }
+
+    const campaignAnnotations = [];
+
+    for (let i = 1; i <= forecastDays; i++) {
+        const nextDate = new Date(lastDate);
+        nextDate.setDate(lastDate.getDate() + i);
+        // Format as DD/MM/YYYY
+        let displayY = nextDate.getFullYear();
+        if (lastDateStr && lastDateStr.split('/')[2] > 2500) displayY += 543;
+        
+        const d = nextDate.getDate();
+        const m = nextDate.getMonth() + 1;
+        const dateStr = `${d.toString().padStart(2, '0')}/${m.toString().padStart(2, '0')}/${displayY}`;
+        
+        let sum = 0;
+        let count = 0;
+        for (let j = Math.max(0, actualData.length - 3); j < actualData.length; j++) {
+            sum += actualData[j];
+            count++;
+        }
+        let avg = count > 0 ? sum / count : lastActualVal;
+        
+        // Campaign detection
+        let isCampaign = false;
+        let campaignName = '';
+        let multiplier = 1.0;
+
+        // Double Day (e.g. 9.9) and 2 days after
+        if (d === m) {
+            isCampaign = true;
+            campaignName = `🛍️ แคมเปญ Double Day (${m}.${m})`;
+            multiplier = 1.5;
+        } else if (d === m + 1) { 
+            isCampaign = true;
+            campaignName = `📦 เก็บตกแคมเปญ (${m}.${m})`;
+            multiplier = 1.35;
+        } else if (d === m + 2) { 
+            isCampaign = true;
+            campaignName = `🚚 ปลายหางแคมเปญ (${m}.${m})`;
+            multiplier = 1.2;
+        } 
+        // TikTok Flashsale (Mid Month)
+        else if (d === 15 || d === 16) {
+            isCampaign = true;
+            campaignName = '⚡ TikTok Flash Sale';
+            multiplier = 1.3;
+        }
+        // TikTok Payday
+        else if (d === 25 || d === 26 || d === 27) {
+            isCampaign = true;
+            campaignName = '💰 TikTok Payday (สิ้นเดือน)';
+            multiplier = 1.4;
+        }
+        
+        let val = avg * (1 + (i * 0.02)); 
+        
+        if (isCampaign) {
+            val = val * multiplier;
+            // Record annotation for this date
+            campaignAnnotations.push({
+                index: actualDates.length - 1 + i,
+                name: campaignName
+            });
+        }
+        
+        forecastDates.push(dateStr);
+        forecastData.push(Math.round(val));
+        upperBound.push(Math.round(val * 1.15));
+        lowerBound.push(Math.round(val * 0.85));
+    }
+
+    forecastChartInstance.config.campaignAnnotations = campaignAnnotations;
+    forecastChartInstance.config.splitIndex = actualDates.length - 1;
+
+    const labels = [...actualDates, ...forecastDates];
+    
+    // Dataset 0: Actual
+    const actualDataset = [...actualData, ...Array(forecastDays).fill(null)];
+    
+    // Dataset 1: Forecast
+    const forecastDataset = [...Array(actualDates.length - 1).fill(null), lastActualVal, ...forecastData];
+    
+    forecastChartInstance.data.labels = labels;
+    forecastChartInstance.data.datasets = [
+        {
+            label: 'ปริมาณจริง (Actual 30 วัน)',
+            data: actualDataset,
+            borderColor: '#0f172a',
+            backgroundColor: '#0f172a',
+            borderWidth: 3,
+            fill: false,
+            tension: 0.4,
+            pointRadius: 4
+        },
+        {
+            label: 'พยากรณ์ล่วงหน้า',
+            data: forecastDataset,
+            borderColor: '#ed1c24',
+            backgroundColor: (context) => {
+                const chart = context.chart;
+                const {ctx, chartArea} = chart;
+                if (!chartArea) return null;
+                const gradient = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+                gradient.addColorStop(0, 'rgba(237, 28, 36, 0.4)');
+                gradient.addColorStop(1, 'rgba(237, 28, 36, 0.0)');
+                return gradient;
+            },
+            borderWidth: 3,
+            borderDash: [5, 5],
+            fill: 'origin',
+            tension: 0.4,
+            pointRadius: 4,
+            pointBackgroundColor: '#ffffff',
+            pointBorderColor: '#ed1c24',
+            pointBorderWidth: 2
+        }
+    ];
+    forecastChartInstance.update();
 }
 
 function detectAnomalies() {
@@ -1186,30 +1726,22 @@ window.renderPerformanceTable = function(dataToUse) {
     if(!tableBody) return;
     tableBody.innerHTML = '';
     
-    const statusFilter = document.getElementById('cec-status-filter') ? document.getElementById('cec-status-filter').value : 'all';
     const searchQuery = document.getElementById('cec-search') ? document.getElementById('cec-search').value.toLowerCase().trim() : '';
 
-    // Filter critical items (e.g., exceptions, returns, etc.)
+    // Show all items without filtering by status (as requested)
     const criticalItems = data.filter(row => {
-        const group = groupStatusForChart(row['สถานะปัจจุบัน'] || '');
-        const isCritical = group === 'นำจ่ายไม่สำเร็จ' || group === 'คืนต้นทาง' || group === 'รอจ่าย ณ ที่ทำการ' || group === 'โทรศัพท์ติดต่อผู้รับ';
-        if (!isCritical) return false;
-        
-        if (statusFilter !== 'all' && group !== statusFilter) return false;
-        
         if (searchQuery) {
-            const trackNo = String(row['Track No.'] || '').toLowerCase();
+            const trackNo = String(row['Track No.'] || row['O Track No.'] || row['สิ่งของ'] || '').toLowerCase();
             const phone = String(row['เบอร์โทรศัพท์ผู้รับ'] || row['เบอร์โทร'] || row['เบอร์โทรศัพท์'] || '').toLowerCase();
             if (!trackNo.includes(searchQuery) && !phone.includes(searchQuery)) {
                 return false;
             }
         }
-        
         return true;
     });
 
     criticalItems.slice(0, 50).forEach(order => {
-        const trackNo = order['Track No.'] || '-';
+        const trackNo = String(order['Track No.'] || '-').trim();
         const receiver = order['ชื่อ-นามสกุลผู้รับ'] || '-';
         const address = order['ที่อยู่ผู้รับ'] || order['ที่อยู่'] || '-';
         const phone = order['เบอร์โทรศัพท์ผู้รับ'] || order['เบอร์โทร'] || order['เบอร์โทรศัพท์'] || '-';
@@ -1725,7 +2257,8 @@ async function executeDataCleanupWithPassword() {
         if (statusEl) statusEl.style.display = 'none';
     }
 }
-window.toggleTracking = function(btn, trackNo, step) {
+window.toggleTracking = function(btn, rawTrackNo, step) {
+    const trackNo = String(rawTrackNo).trim();
     const key = `tracking_${trackNo}_${step}`;
     const isActive = btn.classList.contains('active');
     
@@ -1890,6 +2423,59 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // === Timeline and Heatmap Logic ===
+window.populateMonthFilters = function() {
+    const data = window.currentDataViews?.dashboard || currentData || originalData;
+    if (!data || data.length === 0) return;
+
+    const thMonths = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'];
+    const uniqueMonths = new Set();
+    let defaultMonth = -1;
+    let latestDate = 0;
+
+    data.forEach(row => {
+        if (!row['วันที่รับฝาก']) return;
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        if (d) {
+            const m = d.getMonth() + 1;
+            uniqueMonths.add(m);
+            if (d.getTime() > latestDate) {
+                latestDate = d.getTime();
+                defaultMonth = m;
+            }
+        }
+    });
+
+    const timelineSelect = document.getElementById('timeline-month-filter');
+    const heatmapSelect = document.getElementById('heatmap-month-filter');
+    
+    if (uniqueMonths.size > 0 && timelineSelect && heatmapSelect) {
+        // Keep current selected value if it exists and is still valid
+        const currTimelineVal = timelineSelect.value;
+        const currHeatmapVal = heatmapSelect.value;
+
+        let optionsHtml = '';
+        const sortedMonths = Array.from(uniqueMonths).sort((a, b) => b - a); // Sort descending
+        sortedMonths.forEach(m => {
+            optionsHtml += `<option value="${m}">${thMonths[m-1]}</option>`;
+        });
+
+        timelineSelect.innerHTML = optionsHtml;
+        heatmapSelect.innerHTML = optionsHtml;
+
+        if (currTimelineVal && uniqueMonths.has(parseInt(currTimelineVal))) {
+            timelineSelect.value = currTimelineVal;
+        } else {
+            timelineSelect.value = defaultMonth;
+        }
+
+        if (currHeatmapVal && uniqueMonths.has(parseInt(currHeatmapVal))) {
+            heatmapSelect.value = currHeatmapVal;
+        } else {
+            heatmapSelect.value = defaultMonth;
+        }
+    }
+};
+
 window.updateTimeline = function() {
     const month = parseInt(document.getElementById('timeline-month-filter').value);
     const data = window.currentDataViews.dashboard || currentData || originalData;
@@ -1915,16 +2501,17 @@ window.updateTimeline = function() {
         
         weeks[weekIdx].t++;
         const status = row['สถานะปัจจุบัน'] || '';
-        if(status.includes('จัดส่งสำเร็จ')) weeks[weekIdx].s++;
-        else if(status.includes('คืน') || status.includes('นำจ่ายไม่สำเร็จ') || status.includes('รอส่งคืน')) weeks[weekIdx].r++;
+        const group = groupStatusForChart(status);
+        if(group === 'นำจ่ายสำเร็จเเล้ว') weeks[weekIdx].s++;
+        else if(group === 'คืนต้นทาง') weeks[weekIdx].r++;
     });
 
     for(let i=1; i<=4; i++) {
         const w = weeks[i-1];
-        let succPct = 0; let retPct = 0;
+        let succPct = "0.00"; let retPct = "0.00";
         if (w.t > 0) {
-            succPct = Math.round((w.s / w.t) * 100);
-            retPct = Math.round((w.r / w.t) * 100);
+            succPct = ((w.s / w.t) * 100).toFixed(2);
+            retPct = ((w.r / w.t) * 100).toFixed(2);
         }
         if(document.getElementById(`tl-w${i}-success`)) document.getElementById(`tl-w${i}-success`).innerText = succPct;
         if(document.getElementById(`tl-w${i}-return`)) document.getElementById(`tl-w${i}-return`).innerText = retPct;
@@ -1998,13 +2585,145 @@ window.updateHeatmap = function() {
     container.innerHTML = html;
 };
 
+window.updateDailyVolumeChart = function() {
+    const month = parseInt(document.getElementById('daily-chart-month-filter').value);
+    const canvas = document.getElementById('dailyVolumeChart');
+    if(!canvas) return;
+    
+    const data = window.currentDataViews.dashboard || currentData || originalData;
+    const monthData = data.filter(row => {
+        if(!row['วันที่รับฝาก']) return false;
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        return d && (d.getMonth() + 1) === month;
+    });
+
+    const dayCounts = {};
+    for(let d = 1; d <= 31; d++) dayCounts[d] = 0;
+    
+    monthData.forEach(row => {
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        const day = d.getDate();
+        if(day >= 1 && day <= 31) dayCounts[day]++;
+    });
+
+    const labels = [];
+    const barData = [];
+    for(let d = 1; d <= 31; d++) {
+        labels.push(d.toString());
+        barData.push(dayCounts[d]);
+    }
+
+    if (window.dailyVolumeChartInstance) {
+        window.dailyVolumeChartInstance.destroy();
+    }
+    
+    const ctx = canvas.getContext('2d');
+    
+    const calloutLabelsPlugin = {
+        id: 'dailyCalloutLabels',
+        afterDatasetsDraw(chart) {
+            const { ctx, data } = chart;
+            const dataset = data.datasets[0]; 
+            if (!dataset || !dataset.data || dataset.data.length === 0) return;
+            
+            const meta = chart.getDatasetMeta(0);
+            
+            ctx.save();
+            ctx.font = '600 10px "Prompt", sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            
+            dataset.data.forEach((val, index) => {
+                if (val === 0) return;
+                const element = meta.data[index];
+                const xPos = element.x;
+                const yPos = element.y;
+                
+                const text = val.toLocaleString();
+                const textWidth = ctx.measureText(text).width;
+                const boxWidth = textWidth + 12;
+                const boxHeight = 20;
+                const boxY = yPos - 35;
+                
+                ctx.beginPath();
+                ctx.moveTo(xPos, yPos);
+                ctx.lineTo(xPos, boxY + boxHeight);
+                ctx.strokeStyle = '#94a3b8';
+                ctx.lineWidth = 1;
+                ctx.setLineDash([2, 2]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                
+                ctx.fillStyle = '#ffffff';
+                ctx.strokeStyle = '#cbd5e1';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.roundRect(xPos - boxWidth/2, boxY, boxWidth, boxHeight, 4);
+                ctx.fill();
+                ctx.stroke();
+                
+                ctx.fillStyle = '#ef4444';
+                ctx.fillText(text, xPos, boxY + boxHeight / 2);
+            });
+            ctx.restore();
+        }
+    };
+
+    window.dailyVolumeChartInstance = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    type: 'bar',
+                    label: 'จำนวนชิ้นงาน',
+                    data: barData,
+                    backgroundColor: 'rgba(239, 68, 68, 0.8)',
+                    borderRadius: 4,
+                    order: 2
+                },
+                {
+                    type: 'line',
+                    label: 'แนวโน้ม',
+                    data: barData,
+                    borderColor: '#3b82f6',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointBackgroundColor: '#ffffff',
+                    pointBorderColor: '#3b82f6',
+                    pointRadius: 4,
+                    order: 1
+                }
+            ]
+        },
+        plugins: [calloutLabelsPlugin],
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            layout: { padding: { top: 40 } },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: { usePointStyle: true, boxWidth: 8, font: { family: 'Prompt' } }
+                }
+            },
+            scales: {
+                y: { beginAtZero: true, grid: { color: '#e2e8f0' }, ticks: { font: { family: 'Prompt' } } },
+                x: { grid: { display: false }, ticks: { font: { family: 'Prompt' } } }
+            }
+        }
+    });
+};
+
 // Add call to update dashboard
 const originalUpdateDashboard = updateDashboard;
 window.updateDashboard = function(dataToUse, viewName) {
     originalUpdateDashboard(dataToUse, viewName);
     if (!viewName || viewName === 'dashboard' || viewName === 'all') {
+        populateMonthFilters();
         updateTimeline();
         updateHeatmap();
+        updateDailyVolumeChart();
     }
 };
 
@@ -2133,5 +2852,631 @@ window.checkStorageCapacityAdmin = async () => {
     html += `<tr style="font-weight: bold; background: #f8fafc; border-top: 2px solid #cbd5e1;"><td style="padding: 6px;">รวมทั้งหมด</td><td style="text-align: right; padding: 6px;">${savedData.length.toLocaleString()}</td><td style="text-align: right; padding: 6px;">${totalMb} MB</td></tr>`;
     html += '</table>';
     
+    const maxMb = 5120;
+    const currentMb = parseFloat(totalMb);
+    const pct = Math.min((currentMb / maxMb) * 100, 100);
+    let barColor = '#10b981';
+    if (pct > 90) barColor = '#ef4444';
+    else if (pct > 75) barColor = '#f59e0b';
+    
+    html += `
+        <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #e2e8f0;">
+            <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 6px; color: var(--color-navy); font-weight: 600;">
+                <span>พื้นที่ใช้งาน Cloudflare D1 (Max: 5 GB)</span>
+                <span>${currentMb.toFixed(2)} MB / 5120 MB (${pct.toFixed(1)}%)</span>
+            </div>
+            <div style="background-color: #e2e8f0; height: 10px; border-radius: 5px; overflow: hidden; box-shadow: inset 0 1px 2px rgba(0,0,0,0.1);">
+                <div style="height: 100%; width: ${pct}%; background-color: ${barColor}; transition: width 0.5s ease;"></div>
+            </div>
+        </div>
+    `;
+    
     resEl.innerHTML = html;
+};
+
+// ========================================
+// === CLIENT REPORT GENERATION SYSTEM ===
+// ========================================
+
+// Init report date picker
+document.addEventListener('DOMContentLoaded', () => {
+    const el = document.getElementById('report-date-range');
+    if (el && typeof flatpickr !== 'undefined') {
+        flatpickr(el, { mode: 'range', dateFormat: 'd/m/Y', locale: 'th' });
+    }
+});
+
+
+const PROVINCE_MAP = {
+    '10': 'กรุงเทพมหานคร', '11': 'สมุทรปราการ', '12': 'นนทบุรี', '13': 'ปทุมธานี', '14': 'พระนครศรีอยุธยา',
+    '15': 'อ่างทอง', '16': 'ลพบุรี', '17': 'สิงห์บุรี', '18': 'ชัยนาท', '19': 'สระบุรี',
+    '20': 'ชลบุรี', '21': 'ระยอง', '22': 'จันทบุรี', '23': 'ตราด', '24': 'ฉะเชิงเทรา', '25': 'ปราจีนบุรี', '26': 'นครนายก', '27': 'สระแก้ว',
+    '30': 'นครราชสีมา', '31': 'บุรีรัมย์', '32': 'สุรินทร์', '33': 'ศรีสะเกษ', '34': 'อุบลราชธานี', '35': 'ยโสธร', '36': 'ชัยภูมิ', '37': 'อำนาจเจริญ', '38': 'บึงกาฬ', '39': 'หนองบัวลำภู',
+    '40': 'ขอนแก่น', '41': 'อุดรธานี', '42': 'เลย', '43': 'หนองคาย', '44': 'มหาสารคาม', '45': 'ร้อยเอ็ด', '46': 'กาฬสินธุ์', '47': 'สกลนคร', '48': 'นครพนม', '49': 'มุกดาหาร',
+    '50': 'เชียงใหม่', '51': 'ลำพูน', '52': 'ลำปาง', '53': 'อุตรดิตถ์', '54': 'แพร่', '55': 'น่าน', '56': 'พะเยา', '57': 'เชียงราย', '58': 'แม่ฮ่องสอน',
+    '60': 'นครสวรรค์', '61': 'อุทัยธานี', '62': 'กำแพงเพชร', '63': 'ตาก', '64': 'สุโขทัย', '65': 'พิษณุโลก', '66': 'พิจิตร', '67': 'เพชรบูรณ์',
+    '70': 'ราชบุรี', '71': 'กาญจนบุรี', '72': 'สุพรรณบุรี', '73': 'นครปฐม', '74': 'สมุทรสาคร', '75': 'สมุทรสงคราม', '76': 'เพชรบุรี', '77': 'ประจวบคีรีขันธ์',
+    '80': 'นครศรีธรรมราช', '81': 'กระบี่', '82': 'พังงา', '83': 'ภูเก็ต', '84': 'สุราษฎร์ธานี', '85': 'ระนอง', '86': 'ชุมพร',
+    '90': 'สงขลา', '91': 'สตูล', '92': 'ตรัง', '93': 'พัทลุง', '94': 'ปัตตานี', '95': 'ยะลา', '96': 'นราธิวาส'
+};
+function getProvinceFromZip(zip) {
+    if (!zip) return 'ไม่ระบุ';
+    let z = String(zip).trim();
+    if (z.length >= 2) {
+        let prefix = z.substring(0, 2);
+        if (PROVINCE_MAP[prefix]) return PROVINCE_MAP[prefix] + ' (' + z + ')';
+    }
+    return z;
+}
+
+function getReportData(startDate, endDate) {
+    const data = window.currentDataViews?.dashboard || currentData || originalData;
+    if (!data || data.length === 0) return null;
+
+    const filtered = data.filter(row => {
+        if (!row['วันที่รับฝาก']) return false;
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        if (!d) return false;
+        return d >= startDate && d <= endDate;
+    });
+
+    const total = filtered.length;
+    let success = 0, returned = 0, waiting = 0, calling = 0, failed = 0, inTransit = 0, codAmount = 0;
+    let codCount = 0, nonCodCount = 0;
+    const destMap = {};
+    const dailyMap = {};
+    const failedReasonsMap = {};
+    const originMap = {};
+
+    filtered.forEach(row => {
+        const status = row['สถานะปัจจุบัน'] || '';
+        const group = groupStatusForChart(status);
+        
+        // COD Calculation
+        let codValRaw = row['ยอด COD'] || row['ยอดเก็บเงินปลายทาง'] || row['COD'] || row['จำนวนเงิน'] || 0;
+        let codVal = 0;
+        if (typeof codValRaw === 'string') {
+            codVal = parseFloat(codValRaw.replace(/,/g, '').trim()) || 0;
+        } else {
+            codVal = parseFloat(codValRaw) || 0;
+        }
+
+        if (codVal > 0) {
+            codCount++;
+            if (group === 'นำจ่ายสำเร็จเเล้ว' || status.includes('เรียบร้อย') || status.includes('สำเร็จ')) {
+                codAmount += codVal;
+            }
+        } else {
+            nonCodCount++;
+        }
+
+        if (group === 'นำจ่ายสำเร็จเเล้ว') success++;
+        else if (group === 'คืนต้นทาง') returned++;
+        else if (group === 'รอจ่าย ณ ที่ทำการ') waiting++;
+        else if (group === 'โทรศัพท์ติดต่อผู้รับ') calling++;
+        else if (group === 'นำจ่ายไม่สำเร็จ') failed++;
+        else inTransit++;
+
+        if (group !== 'นำจ่ายสำเร็จเเล้ว' && group !== 'อยู่ระหว่างทาง/นำจ่าย') {
+            const s = status.replace(/เ/g, 'เ'); 
+            const excludeWords = [
+                'โทรติดต่อผู้รับ',
+                'โทรศัพท์ติดต่อผู้รับ',
+                'ถึงศูนย์คัดแยกสินค้า/ที่ทำการ',
+                'ถึงศูนย์คัดเเยก', 
+                'ส่งออกจากศูนย์คัดแยกสินค้า/ที่ทำการ',
+                'ส่งออกจากศูนย์คัดเเยก', 
+                'โทรศัพท์ติดต่อผู้รับ/ผู้ฝากแล้ว ให้เก็บรอนำจ่าย',
+                'ถึง ปณ.ปลายทาง เตรียมนำจ่าย',
+                'ถึง ปณ ปลายทาง เตรียม', 
+                'อยู่ระหว่างคัดแยกสินค้า',
+                'ปณ.ปลายทางส่งคืน',
+                'ปณ ต้นทางส่งคืนบริษัท', 
+                'ปณ.ต้นทางส่งคืนบริษัท', 
+                'คาดว่าจะได้รับ'
+            ];
+            const isExcluded = excludeWords.some(ex => s.includes(ex));
+            if (!isExcluded) {
+                failedReasonsMap[status] = (failedReasonsMap[status] || 0) + 1;
+            }
+        }
+
+        // Destination breakdown
+        let zipCodeStr = '';
+        for (let key in row) {
+            if (key.includes('รหัส') || key.toLowerCase().includes('zip')) {
+                zipCodeStr = row[key];
+                break;
+            }
+        }
+        if (!zipCodeStr) zipCodeStr = row['เขตที่ทำการปลายทาง'] || row['จังหวัดปลายทาง'] || row['ปลายทาง'] || row['จังหวัด'] || '';
+        let dest = getProvinceFromZip(zipCodeStr);
+        destMap[dest] = (destMap[dest] || 0) + 1;
+
+        // Daily breakdown
+        const d = normalizeDateObject(row['วันที่รับฝาก']);
+        if (d) {
+            const key = `${d.getDate()}/${d.getMonth()+1}`;
+            dailyMap[key] = (dailyMap[key] || 0) + 1;
+        }
+
+        // Origin breakdown
+        const origin = row['ต้นทาง'] || row['เขตที่ทำการต้นทาง'] || 'ไม่ระบุ';
+        originMap[origin] = (originMap[origin] || 0) + 1;
+    });
+
+    // Top 10 destinations
+    const topDest = Object.entries(destMap).sort((a,b) => b[1] - a[1]).slice(0, 10);
+    // Top 3 origins
+    const topOrigin = Object.entries(originMap).sort((a,b) => b[1] - a[1]).slice(0, 3);
+
+    return {
+        total, success, returned, waiting, calling, failed, inTransit, codAmount, codCount, dailyMap, failedReasonsMap, nonCodCount,
+        successRate: total > 0 ? ((success / total) * 100).toFixed(1) : '0',
+        returnRate: total > 0 ? ((returned / total) * 100).toFixed(1) : '0',
+        waitingRate: total > 0 ? ((waiting / total) * 100).toFixed(1) : '0',
+        failedRate: total > 0 ? ((failed / total) * 100).toFixed(1) : '0',
+        topDest, topOrigin, dailyMap
+    };
+}
+
+function formatThaiDate(d) {
+    const thMonths = ['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
+    return `${d.getDate()} ${thMonths[d.getMonth()]} ${d.getFullYear() + 543}`;
+}
+
+window.generateReport = function(type) {
+    const rangeInput = document.getElementById('report-date-range');
+    if (!rangeInput || !rangeInput.value) {
+        alert('กรุณาเลือกช่วงเวลาก่อนสร้างรายงานครับ');
+        return;
+    }
+
+    const parts = rangeInput.value.split(' ถึง ');
+    if (!parts || parts.length < 1) { alert('กรุณาเลือกช่วงเวลาให้ครบ'); return; }
+    
+    const parseFlatpickrDate = (str) => {
+        const p = str.trim().split('/');
+        return new Date(parseInt(p[2]), parseInt(p[1])-1, parseInt(p[0]));
+    };
+    
+    const startDate = parseFlatpickrDate(parts[0]);
+    const endDate = parts.length > 1 ? parseFlatpickrDate(parts[1]) : new Date(startDate);
+    endDate.setHours(23, 59, 59);
+
+    const rd = getReportData(startDate, endDate);
+    if (!rd || rd.total === 0) {
+        alert('ไม่พบข้อมูลในช่วงเวลาที่เลือก');
+        return;
+    }
+
+    const canvas = document.getElementById('report-canvas');
+    const dateRangeText = `${formatThaiDate(startDate)} - ${formatThaiDate(endDate)}`;
+    const reportTitleBase = type === 'weekly' ? 'รายงานสรุปผลการดำเนินงานประจำสัปดาห์' : 'รายงานสรุปผลการดำเนินงานประจำเดือน';
+    const reportTitle = `${reportTitleBase}<br><span style="color: #ef4444; font-weight: 800;">เพจ ราชาก๋วยจั๊บ</span>`;
+    const now = new Date();
+
+    // Build status bar chart SVG
+    const maxVal = Math.max(rd.success, rd.returned, rd.waiting, rd.calling, rd.failed, rd.inTransit, 1);
+    const statusData = [
+        { label: 'นำจ่ายสำเร็จ', value: rd.success, color: '#0f172a', icon: '<i class="fa-solid fa-circle-check"></i>' },
+        { label: 'คืนต้นทาง', value: rd.returned, color: '#dc2626', icon: '<i class="fa-solid fa-arrow-rotate-left"></i>' },
+        { label: 'รอจ่าย ณ ที่ทำการ', value: rd.waiting, color: '#475569', icon: '<i class="fa-solid fa-building"></i>' },
+        { label: 'โทรศัพท์ติดต่อ', value: rd.calling, color: '#64748b', icon: '<i class="fa-solid fa-phone"></i>' },
+        { label: 'นำจ่ายไม่สำเร็จ', value: rd.failed, color: '#94a3b8', icon: '<i class="fa-solid fa-circle-xmark"></i>' },
+        { label: 'อยู่ระหว่างทาง', value: rd.inTransit, color: '#cbd5e1', icon: '<i class="fa-solid fa-truck"></i>' },
+    ];
+
+    let statusBarsHtml = statusData.map(s => {
+        const pct = maxVal > 0 ? (s.value / maxVal * 100) : 0;
+        const pctOfTotal = rd.total > 0 ? ((s.value / rd.total) * 100).toFixed(1) : '0';
+        return `<div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+            <span style="width: 130px; font-size: 11px; color: #334155; font-weight: 600; text-align: right;">${s.icon} ${s.label}</span>
+            <div style="flex: 1; background: #f1f5f9; height: 16px; border-radius: 2px; overflow: hidden; position: relative; border: 1px solid #e2e8f0;">
+                <div style="width: ${pct}%; height: 100%; background: ${s.color}; transition: width 0.3s;"></div>
+            </div>
+            <span style="width: 80px; font-size: 11px; font-weight: 700; color: #0f172a; text-align: left;">${s.value.toLocaleString()} <span style="color: #64748b; font-weight: normal;">(${pctOfTotal}%)</span></span>
+        </div>`;
+    }).join('');
+
+    // Build top 10 destinations heatmap
+    
+    let failedReasonsTableHtml = '';
+    if (rd.failedReasonsMap) {
+        const topFailed = Object.entries(rd.failedReasonsMap).sort((a,b) => b[1] - a[1]);
+        if (topFailed.length > 0) {
+            const maxFailed = topFailed[0][1];
+            const failedList = topFailed.map((d, i) => {
+                const heatPct = (d[1] / maxFailed) * 100;
+                return `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <div style="font-size: 11px; color: #334155; font-weight: 500; display: flex; align-items: center; gap: 6px; width: calc(100% - 100px);">
+                        <span style="color: #64748b; font-size: 10px; width: 14px; flex-shrink: 0;">${i + 1}.</span>
+                        <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;" title="${d[0]}">${d[0]}</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div style="width: 50px; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden;">
+                            <div style="height: 100%; width: ${heatPct}%; background: #f59e0b;"></div>
+                        </div>
+                        <div style="font-size: 11px; font-weight: 700; color: #0f172a; width: 35px; text-align: right;">
+                            ${d[1].toLocaleString()}
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
+            
+            failedReasonsTableHtml = `
+            <div style="background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 15px; position: relative; margin-top: 15px;">
+                <div style="font-size: 12px; font-weight: 700; color: #d97706; margin-bottom: 12px; display: flex; align-items: center; gap: 6px;">
+                    <i class="fa-solid fa-triangle-exclamation" style="color: #d97706;"></i> สาเหตุที่นำจ่ายไม่สำเร็จ
+                </div>
+                <div style="max-height: 250px; overflow-y: auto; padding-right: 5px;">
+                    ${failedList}
+                </div>
+            </div>`;
+        }
+    }
+
+    let destTableHtml = '';
+    if (rd.topDest.length > 0) {
+        const topDestMax = rd.topDest[0][1];
+        destTableHtml = rd.topDest.map((d, i) => {
+            const heatPct = (d[1] / topDestMax) * 100;
+            const opacity = Math.max(0.15, heatPct / 100);
+            return `<div style="display: flex; align-items: center; gap: 6px; margin-bottom: 5px;">
+                <span style="width: 14px; font-size: 9px; color: #64748b; font-weight: 700; text-align: right;">${i+1}.</span>
+                <span style="width: 65px; font-size: 10px; color: #334155; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${d[0]}</span>
+                <div style="flex: 1; background: rgba(241,245,249,0.5); height: 10px; border-radius: 2px; overflow: hidden;">
+                    <div style="width: ${heatPct}%; height: 100%; background: rgba(220, 38, 38, ${opacity});"></div>
+                </div>
+                <span style="width: 35px; font-size: 10px; font-weight: 800; color: #0f172a; text-align: right;">${d[1].toLocaleString()}</span>
+            </div>`;
+        }).join('');
+    }
+
+    // Build donut chart SVG (Success Rate)
+    const donutData = [
+        { value: rd.success, color: '#0f172a', label: 'สำเร็จ' },
+        { value: rd.returned, color: '#dc2626', label: 'คืนต้นทาง' },
+        { value: rd.total - rd.success - rd.returned, color: '#cbd5e1', label: 'อื่นๆ' },
+    ];
+    let donutSvg = buildDonutSVG(donutData, 55, 16);
+
+    // Build donut chart SVG (COD vs Non-COD)
+    const donutCodData = [
+        { value: rd.codCount, color: '#dc2626', label: 'COD' },
+        { value: rd.nonCodCount, color: '#cbd5e1', label: 'Non-COD' },
+    ];
+    let donutCodSvg = buildDonutSVG(donutCodData, 55, 16);
+
+    // Generate Heatmap
+    const dailyKeys = Object.keys(rd.dailyMap || {});
+    // Sort dates
+    dailyKeys.sort((a, b) => {
+        let pa = a.split('/');
+        let pb = b.split('/');
+        let da = new Date(2026, parseInt(pa[1])-1, parseInt(pa[0]));
+        let db = new Date(2026, parseInt(pb[1])-1, parseInt(pb[0]));
+        return da - db;
+    });
+    
+    let maxDaily = 0;
+    dailyKeys.forEach(k => { if(rd.dailyMap[k] > maxDaily) maxDaily = rd.dailyMap[k]; });
+
+    let heatmapCells = '';
+    dailyKeys.forEach(k => {
+        const val = rd.dailyMap[k];
+        const pct = maxDaily > 0 ? val / maxDaily : 0;
+        let bg = '#fee2e2'; // Lightest red
+        let color = '#7f1d1d';
+        if (pct > 0.8) { bg = '#b91c1c'; color = '#fff'; }
+        else if (pct > 0.6) { bg = '#ef4444'; color = '#fff'; }
+        else if (pct > 0.4) { bg = '#f87171'; color = '#fff'; }
+        else if (pct > 0.2) { bg = '#fca5a5'; color = '#7f1d1d'; }
+
+        heatmapCells += `
+            <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; background: ${bg}; border-radius: 2px; padding: 2px; min-width: 0; height: 26px; flex: 1; border: 1px solid rgba(0,0,0,0.05);">
+                <div style="font-size: 6px; font-weight: 600; color: ${color}; opacity: 0.8; margin-bottom: 1px;">${k}</div>
+                <div style="font-size: 9px; font-weight: 800; color: ${color};">${val}</div>
+            </div>
+        `;
+    });
+
+    const mapSvg = `
+    <div style="width: 100%; display: flex; flex-direction: column;">
+        <div style="font-size: 10px; font-weight: 700; color: #0f172a; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; border-bottom: 1px dashed #cbd5e1; padding-bottom: 4px;">
+            <i class="fa-solid fa-calendar-days" style="color: #dc2626;"></i> ความหนาแน่นชิ้นงาน (Daily Heatmap)
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; width: 100%;">
+            ${heatmapCells}
+        </div>
+    </div>`;
+
+    // Calculate Back-office Tracking Statistics
+    let trackStep1 = 0, trackStep2 = 0, trackStep3 = 0, trackTotal = 0;
+    const filteredForReport = currentData.filter(row => {
+        const dObj = normalizeDateObject(row['วันที่รับฝาก']);
+        if (!dObj) return false;
+        return dObj >= startDate && dObj <= endDate;
+    });
+    filteredForReport.forEach(row => {
+        const tNo = String(row['Track No.'] || '').trim();
+        if(!tNo || tNo === '-') return;
+        const s1 = localStorage.getItem(`tracking_${tNo}_1`);
+        const s2 = localStorage.getItem(`tracking_${tNo}_2`);
+        const s3 = localStorage.getItem(`tracking_${tNo}_3`);
+        if(s1 || s2 || s3) trackTotal++;
+        if(s1) trackStep1++;
+        if(s2) trackStep2++;
+        if(s3) trackStep3++;
+    });
+
+    const trackingStatsSvg = `
+    <div style="width: 100%; display: flex; flex-direction: column; margin-top: 15px;">
+        <div style="font-size: 10px; font-weight: 700; color: #0f172a; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; border-bottom: 1px dashed #cbd5e1; padding-bottom: 4px;">
+            <i class="fa-solid fa-headset" style="color: #4f46e5;"></i> สถิติติดตามงานหลังบ้าน
+        </div>
+        <div style="display: flex; gap: 10px; justify-content: space-between; font-size: 9px; color: #334155;">
+            <div style="background: #f1f5f9; padding: 6px; border-radius: 4px; flex: 1; text-align: center; border: 1px solid #e2e8f0;">
+                <div style="font-weight: 600; color: #64748b; margin-bottom: 2px;">ติดตามรวม</div>
+                <div style="font-size: 14px; font-weight: 800; color: #4f46e5;">${trackTotal.toLocaleString()} <span style="font-size:8px; font-weight:500;">ชิ้น</span></div>
+            </div>
+            <div style="background: #f0fdf4; padding: 6px; border-radius: 4px; flex: 1; text-align: center; border: 1px solid #dcfce3;">
+                <div style="font-weight: 600; color: #16a34a; margin-bottom: 2px;">ครั้งที่ 1</div>
+                <div style="font-size: 12px; font-weight: 700; color: #15803d;">${trackStep1.toLocaleString()} <span style="font-size:8px; font-weight:500;">ครั้ง</span></div>
+            </div>
+            <div style="background: #fefce8; padding: 6px; border-radius: 4px; flex: 1; text-align: center; border: 1px solid #fef08a;">
+                <div style="font-weight: 600; color: #ca8a04; margin-bottom: 2px;">ครั้งที่ 2</div>
+                <div style="font-size: 12px; font-weight: 700; color: #a16207;">${trackStep2.toLocaleString()} <span style="font-size:8px; font-weight:500;">ครั้ง</span></div>
+            </div>
+            <div style="background: #fef2f2; padding: 6px; border-radius: 4px; flex: 1; text-align: center; border: 1px solid #fecaca;">
+                <div style="font-weight: 600; color: #dc2626; margin-bottom: 2px;">ครั้งที่ 3</div>
+                <div style="font-size: 12px; font-weight: 700; color: #b91c1c;">${trackStep3.toLocaleString()} <span style="font-size:8px; font-weight:500;">ครั้ง</span></div>
+            </div>
+        </div>
+    </div>`;
+
+    canvas.innerHTML = `
+    <!-- HEADER -->
+    <div style="background: white; border-bottom: 4px solid #dc2626; color: #0f172a; padding: 25px 30px; display: flex; justify-content: space-between; align-items: center;">
+        <div style="display: flex; align-items: center; gap: 15px;">
+            <img src="logo.png" alt="THP Logo" style="height: 50px;">
+            <div>
+                <div style="font-size: 20px; font-weight: 700; letter-spacing: 0.5px; color: #0f172a;">${reportTitle}</div>
+                <div style="font-size: 12px; color: #64748b; margin-top: 4px; font-weight: 500;">
+                    <i class="fa-solid fa-calendar-days"></i> วันที่วิเคราะห์ข้อมูล: ${dateRangeText}
+                </div>
+            </div>
+        </div>
+        <div style="text-align: right; border-left: 2px solid #e2e8f0; padding-left: 15px;">
+            <div style="font-size: 11px; color: #64748b; font-weight: 600;">ปริมาณงานรวม (ชิ้น)</div>
+            <div style="font-size: 32px; font-weight: 800; color: #dc2626; line-height: 1.1;">${rd.total.toLocaleString()}</div>
+        </div>
+    </div>
+
+    <!-- KPI STRIP (2x2) -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 20px 30px; background: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+        <div style="background: white; border: 1px solid #cbd5e1; border-left: 4px solid #0f172a; padding: 14px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+            <div>
+                <div style="font-size: 11px; color: #64748b; font-weight: 600; margin-bottom: 4px;"><i class="fa-solid fa-check"></i> นำจ่ายสำเร็จ</div>
+                <div style="font-size: 22px; font-weight: 800; color: #0f172a;">${rd.success.toLocaleString()} <span style="font-size: 10px; font-weight: normal; color: #64748b;">ชิ้น</span></div>
+            </div>
+            <div style="font-size: 12px; color: #0f172a; font-weight: 700; background: #f1f5f9; padding: 3px 8px; border-radius: 12px;">${rd.successRate}%</div>
+        </div>
+        <div style="background: white; border: 1px solid #cbd5e1; border-left: 4px solid #dc2626; padding: 14px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+            <div>
+                <div style="font-size: 11px; color: #64748b; font-weight: 600; margin-bottom: 4px;"><i class="fa-solid fa-rotate-left"></i> คืนต้นทาง</div>
+                <div style="font-size: 22px; font-weight: 800; color: #dc2626;">${rd.returned.toLocaleString()} <span style="font-size: 10px; font-weight: normal; color: #64748b;">ชิ้น</span></div>
+            </div>
+            <div style="font-size: 12px; color: #dc2626; font-weight: 700; background: #fef2f2; padding: 3px 8px; border-radius: 12px;">${rd.returnRate}%</div>
+        </div>
+        <div style="background: white; border: 1px solid #cbd5e1; border-left: 4px solid #64748b; padding: 14px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+            <div>
+                <div style="font-size: 11px; color: #64748b; font-weight: 600; margin-bottom: 4px;"><i class="fa-solid fa-truck"></i> ปริมาณเฉลี่ยต่อวัน</div>
+                <div style="font-size: 22px; font-weight: 800; color: #475569;">${Math.round(rd.total / Math.max(Object.keys(rd.dailyMap).length, 1)).toLocaleString()} <span style="font-size: 10px; font-weight: normal; color: #64748b;">ชิ้น/วัน</span></div>
+            </div>
+        </div>
+        <div style="background: white; border: 1px solid #cbd5e1; border-left: 4px solid #f59e0b; padding: 14px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+            <div>
+                <div style="font-size: 11px; color: #64748b; font-weight: 600; margin-bottom: 4px;"><i class="fa-solid fa-money-bill-wave"></i> ยอดเรียกเก็บ COD สำเร็จ</div>
+                <div style="font-size: 22px; font-weight: 800; color: #d97706;">${rd.codAmount.toLocaleString()} <span style="font-size: 10px; font-weight: normal; color: #64748b;">บาท</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MAIN BODY -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0; min-height: 540px;">
+        <!-- LEFT COLUMN -->
+        <div style="padding: 20px 30px; border-right: 1px solid #e2e8f0;">
+            <!-- Status Distribution -->
+            <div style="margin-bottom: 25px;">
+                <div style="font-size: 12px; font-weight: 700; color: #0f172a; margin-bottom: 12px; padding-bottom: 4px; border-bottom: 2px solid #dc2626;">
+                    <i class="fa-solid fa-chart-bar"></i> การกระจายตัวของสถานะชิ้นงาน
+                </div>
+                ${statusBarsHtml}
+            </div>
+
+            <!-- 2 Donut Charts (Side by side) -->
+            <div style="display: flex; gap: 15px; margin-top: 20px;">
+                <!-- Success Rate Donut -->
+                <div style="flex: 1;">
+                    <div style="font-size: 11px; font-weight: 700; color: #0f172a; margin-bottom: 15px; text-align: center;">
+                        <i class="fa-solid fa-chart-pie"></i> อัตราสำเร็จ
+                    </div>
+                    <div style="display: flex; flex-direction: column; align-items: center; gap: 10px;">
+                        ${donutSvg}
+                        <div style="font-size: 9px; color: #334155; font-weight: 500; text-align: left; width: 100%;">
+                            <div style="margin-bottom: 4px;"><span style="display: inline-block; width: 8px; height: 8px; background: #0f172a; margin-right: 4px;"></span> สำเร็จ: <strong>${rd.success.toLocaleString()}</strong></div>
+                            <div style="margin-bottom: 4px;"><span style="display: inline-block; width: 8px; height: 8px; background: #dc2626; margin-right: 4px;"></span> คืน: <strong>${rd.returned.toLocaleString()}</strong></div>
+                            <div><span style="display: inline-block; width: 8px; height: 8px; background: #cbd5e1; margin-right: 4px;"></span> อื่นๆ: <strong>${(rd.total - rd.success - rd.returned).toLocaleString()}</strong></div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- COD Donut -->
+                <div style="flex: 1; border-left: 1px solid #e2e8f0; padding-left: 15px;">
+                    <div style="font-size: 11px; font-weight: 700; color: #0f172a; margin-bottom: 15px; text-align: center;">
+                        <i class="fa-solid fa-box-open"></i> สัดส่วนพัสดุ COD
+                    </div>
+                    <div style="display: flex; flex-direction: column; align-items: center; gap: 10px;">
+                        ${donutCodSvg}
+                        <div style="font-size: 9px; color: #334155; font-weight: 500; text-align: left; width: 100%;">
+                            <div style="margin-bottom: 4px;"><span style="display: inline-block; width: 8px; height: 8px; background: #dc2626; margin-right: 4px;"></span> เรียกเก็บ COD: <strong>${rd.codCount.toLocaleString()}</strong></div>
+                            <div><span style="display: inline-block; width: 8px; height: 8px; background: #cbd5e1; margin-right: 4px;"></span> ไม่เรียกเก็บ: <strong>${rd.nonCodCount.toLocaleString()}</strong></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            ${failedReasonsTableHtml}
+        </div>
+
+        <!-- RIGHT COLUMN -->
+        <div style="padding: 20px 30px; display: flex; flex-direction: column;">
+            
+            <!-- Academic Summary (Moved to top) -->
+            <div style="border: 1px solid #cbd5e1; background: rgba(248, 250, 252, 0.85); padding: 8px 12px; margin-bottom: 15px; position: relative; z-index: 2;">
+                <div style="position: absolute; top: -1px; left: -1px; width: 4px; height: 100%; background: #0f172a;"></div>
+                <div style="font-size: 10px; font-weight: 700; color: #0f172a; margin-bottom: 6px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px;">
+                    <i class="fa-solid fa-file-lines"></i> สรุปข้อมูลเชิงสถิติ
+                </div>
+                <div style="font-size: 9px; color: #334155; line-height: 1.8; font-weight: 500;">
+                    <div style="display: flex; justify-content: space-between; border-bottom: 1px dotted #e2e8f0;"><span>ปริมาณชิ้นงานเข้าสู่ระบบ:</span> <strong style="color: #0f172a;">${rd.total.toLocaleString()} ชิ้น</strong></div>
+                    <div style="display: flex; justify-content: space-between; border-bottom: 1px dotted #e2e8f0;"><span>อัตราความสำเร็จในการนำจ่าย:</span> <strong style="color: #0f172a;">${rd.successRate}%</strong></div>
+                    <div style="display: flex; justify-content: space-between; border-bottom: 1px dotted #e2e8f0;"><span>อัตราการส่งคืนต้นทาง:</span> <strong style="color: #dc2626;">${rd.returnRate}%</strong></div>
+                    <div style="display: flex; justify-content: space-between; border-bottom: 1px dotted #e2e8f0;"><span>ยอด COD ที่สำเร็จ:</span> <strong style="color: #0f172a;">${rd.codAmount.toLocaleString()} ฿</strong></div>
+                    <div style="display: flex; justify-content: space-between;"><span>ปริมาณเฉลี่ยต่อวัน:</span> <strong style="color: #0f172a;">${Math.round(rd.total / Math.max(Object.keys(rd.dailyMap).length, 1)).toLocaleString()} ชิ้น/วัน</strong></div>
+                </div>
+            </div>
+            
+            <!-- Daily Heatmap -->
+            <div style="border-radius: 8px; flex: 1; margin-top: 5px; background: #fff; border: 1px solid #e2e8f0; padding: 8px; box-shadow: -2px 4px 10px rgba(0,0,0,0.03);">
+                ${mapSvg}
+                ${trackingStatsSvg}
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER -->
+    <div style="background: #0f172a; color: white; padding: 12px 30px; display: flex; justify-content: space-between; align-items: center; font-size: 10px; position: absolute; bottom: 0; width: 100%; box-sizing: border-box;">
+        <div style="opacity: 0.8; font-weight: 500;">
+            <i class="fa-solid fa-building"></i> THP e-Commerce REG.10 เพจราชาก๋วยจั๊บ | ออกรายงาน ณ วันที่: ${formatThaiDate(now)}
+        </div>
+        <div style="opacity: 0.6; font-weight: 600; letter-spacing: 0.5px;">
+            ${type === 'weekly' ? 'WEEKLY ANALYTICAL REPORT' : 'MONTHLY ANALYTICAL REPORT'}
+        </div>
+    </div>
+    `;
+
+    document.getElementById('report-preview-area').style.display = 'block';
+    document.getElementById('report-empty-state').style.display = 'none';
+};
+
+function buildDonutSVG(data, radius, thickness) {
+    const total = data.reduce((s, d) => s + d.value, 0);
+    if (total === 0) return '<div style="color:#94a3b8;">ไม่มีข้อมูล</div>';
+    const cx = radius + 5;
+    const cy = radius + 5;
+    const size = (radius + 5) * 2;
+    let startAngle = -90;
+    let paths = '';
+
+    data.forEach(d => {
+        if (d.value === 0) return;
+        const pct = d.value / total;
+        const angle = pct * 360;
+        const endAngle = startAngle + angle;
+        const largeArc = angle > 180 ? 1 : 0;
+        const r1 = radius;
+        const r2 = radius - thickness;
+
+        const x1 = cx + r1 * Math.cos(Math.PI * startAngle / 180);
+        const y1 = cy + r1 * Math.sin(Math.PI * startAngle / 180);
+        const x2 = cx + r1 * Math.cos(Math.PI * endAngle / 180);
+        const y2 = cy + r1 * Math.sin(Math.PI * endAngle / 180);
+        const x3 = cx + r2 * Math.cos(Math.PI * endAngle / 180);
+        const y3 = cy + r2 * Math.sin(Math.PI * endAngle / 180);
+        const x4 = cx + r2 * Math.cos(Math.PI * startAngle / 180);
+        const y4 = cy + r2 * Math.sin(Math.PI * startAngle / 180);
+
+        paths += `<path d="M${x1},${y1} A${r1},${r1} 0 ${largeArc} 1 ${x2},${y2} L${x3},${y3} A${r2},${r2} 0 ${largeArc} 0 ${x4},${y4} Z" fill="${d.color}"/>`;
+        startAngle = endAngle;
+    });
+
+    // Center text
+    const mainPct = total > 0 ? ((data[0].value / total) * 100).toFixed(0) : 0;
+    return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+        ${paths}
+        <text x="${cx}" y="${cy - 4}" text-anchor="middle" font-size="16" font-weight="800" fill="#0f172a">${mainPct}%</text>
+        <text x="${cx}" y="${cy + 10}" text-anchor="middle" font-size="8" fill="#64748b">สำเร็จ</text>
+    </svg>`;
+}
+
+window.downloadReportAsImage = async function() {
+    const canvas = document.getElementById('report-canvas');
+    if (!canvas) return;
+
+    const btn = document.getElementById('btn-download-report');
+    const origText = btn.innerHTML;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังสร้างไฟล์...';
+    btn.disabled = true;
+
+    try {
+        const result = await html2canvas(canvas, {
+            scale: 2,
+            useCORS: true,
+            backgroundColor: '#ffffff',
+            logging: false
+        });
+
+        const link = document.createElement('a');
+        const now = new Date();
+        const fileName = `THP_Report_${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}.png`;
+        link.download = fileName;
+        link.href = result.toDataURL('image/png');
+        link.click();
+    } catch(e) {
+        console.error('Report export error:', e);
+        alert('เกิดข้อผิดพลาดในการสร้างไฟล์ภาพ');
+    }
+
+    btn.innerHTML = origText;
+    btn.disabled = false;
+};
+
+
+window.showCriticalModal = () => {
+    if(!window.criticalItemsData) return;
+    
+    let html = '<h4 style="color:#dc2626; margin-bottom:10px;"><i class="fa-solid fa-clock"></i> เกิน SLA 24H (' + window.criticalItemsData.sla24H.length + ' ชิ้น)</h4>';
+    html += buildCriticalTable(window.criticalItemsData.sla24H);
+    
+    html += '<h4 style="color:#d97706; margin-top:25px; margin-bottom:10px;"><i class="fa-solid fa-map-location-dot"></i> รอแก้ที่อยู่ (' + window.criticalItemsData.addressIssue.length + ' ชิ้น)</h4>';
+    html += buildCriticalTable(window.criticalItemsData.addressIssue);
+    
+    document.getElementById('criticalModalContent').innerHTML = html;
+    document.getElementById('criticalModal').style.display = 'flex';
+};
+
+window.buildCriticalTable = (items) => {
+    if (items.length === 0) return '<p style="color: #64748b; font-size: 0.85rem; padding: 10px; background: #f8fafc; border-radius: 4px; border: 1px dashed #cbd5e1;">ไม่มีรายการในกลุ่มนี้</p>';
+    let html = '<table style="width: 100%; border-collapse: collapse; font-size: 0.85rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-radius: 6px; overflow: hidden;">';
+    html += '<tr style="background: #1e293b; color: white;"><th style="padding: 10px; text-align: left;">Tracking</th><th style="padding: 10px; text-align: left;">วันที่รับฝาก</th><th style="padding: 10px; text-align: left;">สถานะปัจจุบัน</th><th style="padding: 10px; text-align: left;">ผู้รับ</th></tr>';
+    
+    items.slice(0, 100).forEach(row => {
+        const track = row['O Track No.'] || row['Track No.'] || row['Track No'] || row['สิ่งของ'] || row['หมายเลขสิ่งของ'] || row['บาร์โค้ด'] || row['tracking'] || row['Tracking'] || row['TRACKING'] || '-';
+        const date = row['วันที่รับฝาก'] || '-';
+        const status = row['สถานะปัจจุบัน'] || '-';
+        const receiver = row['ชื่อผู้รับ'] || row['ผู้รับ'] || '-';
+        
+        const qmsUrl = track !== '-' ? `http://qms.thailandpost.com/web/Tracking/singleTracking.aspx?type=item&id=${track}` : '#';
+        const trackHtml = `<a href="${qmsUrl}" target="_blank" style="color: #3b82f6; font-weight: bold; text-decoration: none;">${track}</a>`;
+        
+        html += `<tr style="border-bottom: 1px solid #e2e8f0; background: white;"><td style="padding: 10px;">${trackHtml}</td><td style="padding: 10px; color:#475569;">${date}</td><td style="padding: 10px; color: #b91c1c; font-weight:500;">${status}</td><td style="padding: 10px;">${receiver}</td></tr>`;
+    });
+    
+    if (items.length > 100) {
+        html += `<tr><td colspan="4" style="text-align: center; padding: 12px; background: #f1f5f9; color: #475569; font-weight: 500;">... และอีก ${items.length - 100} รายการ (แสดงผลสูงสุด 100 รายการ)</td></tr>`;
+    }
+    html += '</table>';
+    return html;
 };

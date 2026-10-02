@@ -89,7 +89,7 @@ async function onRequestDelete(context) {
 }
 __name(onRequestDelete, "onRequestDelete");
 
-// ../.wrangler/tmp/pages-Ym7n0J/functionsRoutes-0.022928254130086256.mjs
+// ../.wrangler/tmp/pages-SoiGcQ/functionsRoutes-0.9296272564306509.mjs
 var routes = [
   {
     routePath: "/api/data",
@@ -114,7 +114,7 @@ var routes = [
   }
 ];
 
-// C:/Users/kongpop.yu/AppData/Local/npm-cache/_npx/32026684e21afda6/node_modules/path-to-regexp/dist.es2015/index.js
+// C:/Users/user/AppData/Local/npm-cache/_npx/32026684e21afda6/node_modules/path-to-regexp/dist.es2015/index.js
 function lexer(str) {
   var tokens = [];
   var i = 0;
@@ -440,7 +440,7 @@ function pathToRegexp(path, keys, options) {
 }
 __name(pathToRegexp, "pathToRegexp");
 
-// C:/Users/kongpop.yu/AppData/Local/npm-cache/_npx/32026684e21afda6/node_modules/wrangler/templates/pages-template-worker.ts
+// C:/Users/user/AppData/Local/npm-cache/_npx/32026684e21afda6/node_modules/wrangler/templates/pages-template-worker.ts
 var escapeRegex = /[.+?^${}()|[\]\\]/g;
 function* executeRequest(request) {
   const requestPath = new URL(request.url).pathname;
